@@ -1,0 +1,6 @@
+name = "mockup"
+backends = ["mock"]
+max_batch = 4
+max_context = 256
+cache_bytes_per_token = 8
+capabilities = []

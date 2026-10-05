@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+.DS_Store
+# model packages (weights, their footless/ folder and tests) are local workspace
+models/*
+!models/.gitkeep
