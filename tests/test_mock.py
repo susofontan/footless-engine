@@ -62,6 +62,31 @@ class MockModelTest(unittest.TestCase):
             r2.prompt_tokens_fed, len(self.engine.runtime.encode("hello there"))
         )
 
+    def test_a_replay_counts_as_prompt_fed(self):
+        """A runtime whose truncate replays what it kept reports it in the
+        first step's forwarded_tokens: those tokens were not saved."""
+        runtime = self.engine.runtime
+        self.engine.generate("hello world", 64)
+        step = runtime.step
+        replay = {"n": 0}
+
+        def truncate(state, n):
+            replay["n"] = n                   # this "model" forwards all it kept again
+            type(runtime).truncate_state(runtime, state, n)
+
+        def replaying(batch, ctx):
+            results = step(batch, ctx)
+            if replay["n"]:
+                item, r = batch[0], results[0]
+                r.forwarded_tokens = replay["n"] + max(len(item.input_tokens), 1)
+                replay["n"] = 0
+            return results
+
+        runtime.truncate_state, runtime.step = truncate, replaying
+        for prompt in ("hello there", "hello world"):    # a cut prompt, then the whole one again
+            r = self.engine.generate(prompt, 4)
+            self.assertEqual(r.prompt_tokens_fed, len(runtime.encode(prompt)), prompt)
+
     def test_state_verbs_roundtrip(self):
         runtime = self.engine.runtime
         st = runtime.new_state()

@@ -408,7 +408,7 @@ def _images_in(message: dict) -> bool:
 class GenerationResult:
     text: str
     tokens: list[int]
-    prompt_tokens_fed: int
+    prompt_tokens_fed: int  # prompt tokens the model ran, a truncate's replay included
     finished: bool
     timing: Timing = field(default_factory=Timing)
     # Did the repetition guard cut the output? `tokens` then holds the prefix
@@ -809,6 +809,7 @@ class Engine:
                 finished = True
 
         consumed = 0                    # prompt tokens the first admission forwarded
+        replayed = 0                    # ...and the matched ones its truncate forwarded again
         first = True
         while True:
             # what the state must hold before the next sample: the prompt, then
@@ -840,6 +841,8 @@ class Engine:
                     # this step, and that work must not be read as the model
                     # slowing down
                     ran = result.forwarded_tokens or len(chunk)
+                    if first and at == 0:   # a truncate's replay runs in the first step
+                        replayed = max(0, ran - len(chunk))
                     timing.prefill_rates.add(ran, elapsed)
                     timing.prefill_seconds += elapsed
                     timing.prefill_tokens += ran
@@ -849,10 +852,14 @@ class Engine:
                     if finished or (max_tokens > 0 and len(generated) >= max_tokens):
                         break
 
+                decoded = 0
                 while not finished and len(generated) < max_tokens:
                     before = len(generated)
                     result, elapsed = yield Want(StepItem(state, [], spec), ctx)
                     absorb(result)
+                    if first and not fed and not decoded:   # the replay, beside the one token
+                        replayed = max(0, result.forwarded_tokens - 1)
+                    decoded += 1
                     produced = len(generated) - before
                     if produced:  # a step that sampled no output is not a decode speed
                         timing.decode_tokens += produced
@@ -889,7 +896,10 @@ class Engine:
         # would need the room of a second one, which a long conversation's
         # state does not leave)
         self.cache.store(context[:matched + at] + generated[taken:], state)
-        return GenerationResult(text, result_tokens, consumed, finished, timing,
+        # the prompt tokens this request ran, a replay included: the rest
+        # is what the cache really saved (usage's cached_tokens)
+        fed_prompt = min(len(tokens), consumed + replayed)
+        return GenerationResult(text, result_tokens, fed_prompt, finished, timing,
                                 looped=cut is not None, absorbed_tokens=generated)
 
     def close(self) -> None:
