@@ -74,8 +74,11 @@ processes its new tokens (`usage.prompt_tokens_details.cached_tokens`).
 
 Function tools are served as vLLM serves them with a tool-call parser, by a
 package that declares `tool_calls`: its template renders `tools`, its
-`tool_calls` verb reads the calls back, and they leave as `tool_calls` (whole
-calls in a stream) with `finish_reason` `"tool_calls"`;
+`tool_calls` verb reads the calls back, and they leave as `tool_calls` with
+`finish_reason` `"tool_calls"`. A stream carries a call as vLLM's does: a
+delta with its id and name (arguments `""`), then deltas of `{"index",
+"function": {"arguments"}}` as the package reads them (per parameter, for a
+package that lists calls still being written);
 `parallel_tool_calls: false` keeps the first. `tool_choice` `"required"` or a
 named function needs constrained decoding, which the engine lacks: served as
 `"auto"` and reported in the log.

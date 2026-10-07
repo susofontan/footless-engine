@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import unittest
 
-from footless.render import Output
+from footless.render import Output, ToolCalls
+from footless.sdk import ContractError
 
 OPEN, CLOSE = 1000, 1001
 
@@ -199,6 +200,39 @@ class SplitCharacterTest(unittest.TestCase):
         for byte in b"ok\xf0\x9f":
             output.push(byte)
         self.assertEqual("".join(t for _, t in output.close()[0]), "ok\ufffd")
+
+
+class ToolCallsTest(unittest.TestCase):
+    """The calls' news: a name once, then the arguments as they grow."""
+
+    @staticmethod
+    def reader(*reads):
+        """A package whose successive reads are `reads` (content, calls)."""
+        it = iter(reads)
+        return ToolCalls(lambda text, final: next(it))
+
+    def test_a_partial_call_sends_its_name_then_its_arguments(self):
+        calls = self.reader(
+            ("", [{"name": "f", "arguments": "{", "partial": True}]),
+            ("", [{"name": "f", "arguments": '{"a": 1', "partial": True}]),
+            ("", [{"name": "f", "arguments": '{"a": 1}'}]))
+        self.assertEqual(calls.push("x")[1], [(0, "f", ""), (0, None, "{")])
+        self.assertEqual(calls.calls, [])            # not complete yet
+        self.assertEqual(calls.push("x")[1], [(0, None, '"a": 1')])
+        self.assertEqual(calls.close()[1], [(0, None, "}")])
+        self.assertEqual(calls.calls, [{"name": "f", "arguments": '{"a": 1}'}])
+
+    def test_arguments_that_do_not_extend_what_was_sent_are_refused(self):
+        calls = self.reader(("", [{"name": "f", "arguments": '{"a"', "partial": True}]),
+                            ("", [{"name": "f", "arguments": '{"b": 2}'}]))
+        calls.push("x")
+        with self.assertRaises(ContractError):
+            calls.close()
+
+    def test_a_partial_call_in_a_final_read_is_refused(self):
+        calls = self.reader(("", [{"name": "f", "arguments": "{", "partial": True}]))
+        with self.assertRaises(ContractError):
+            calls.close()
 
 
 if __name__ == "__main__":

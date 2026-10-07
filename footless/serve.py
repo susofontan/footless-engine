@@ -525,7 +525,8 @@ class _Stream:
                  usage: _Usage, echo: str, prompt_ids: list[int],
                  calls: ToolCalls | None = None) -> None:
         self.job = job
-        self.calls = calls  # the answer's tool calls carved out as they complete
+        self.calls = calls  # the answer's tool calls carved out as they grow
+        self.call_ids: list[str] = []
         self.request = request
         self.response_id = response_id
         self.created = created
@@ -557,24 +558,29 @@ class _Stream:
             fields: dict = {}
             for kind, text in pieces:
                 fields[kind] = fields.get(kind, "") + text
-            if made:
-                fields["tool_calls"] = [
-                    wire.tool_call(wire.tool_call_id(), call["name"], call["arguments"], i)
-                    for i, call in made]
-            chunk = wire.chat_chunk(
-                self.request.model, self.response_id, self.created, self.index, fields,
-                logprobs=wire.chat_logprobs(rows) if rows else None,
-            )
+            if pieces or rows:
+                self._send(wire.chat_chunk(
+                    self.request.model, self.response_id, self.created, self.index, fields,
+                    logprobs=wire.chat_logprobs(rows) if rows else None,
+                ))
+            # as vLLM streams a call: its id and name, then its arguments as they grow
+            for i, name, args in made:
+                if name is not None:
+                    self.call_ids.append(wire.tool_call_id())
+                    delta = wire.tool_call(self.call_ids[i], name, "", i)
+                else:
+                    delta = {"index": i, "function": {"arguments": args}}
+                self._send(wire.chat_chunk(self.request.model, self.response_id, self.created,
+                                           self.index, {"tool_calls": [delta]}))
         else:
-            chunk = wire.completion_chunk(
+            self._send(wire.completion_chunk(
                 self.request.model, self.response_id, self.created, self.index,
                 "".join(text for _, text in pieces),
                 logprobs=wire.completion_logprobs(rows, len(self.echo)) if rows else None,
-            )
-        self._send(chunk)
+            ))
 
     def _carve(self, pieces, final: bool):
-        """The answer pieces through the call reader: content and new calls."""
+        """The answer pieces through the call reader: content and the calls' news."""
         out, made = [], []
         for kind, text in pieces:
             if kind == "content":

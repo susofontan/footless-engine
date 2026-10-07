@@ -4,7 +4,7 @@
 Its template writes the tools it is given into the prompt (and records each
 render in `chats`), and it answers with `script`, a text a test sets. A call
 in that text is `[[NAME ARGS]]`, ARGS being JSON text; the `tool_calls` verb
-reads them back out. The format is the mock's own on purpose: the engine must
+reads them back out, and lists a call still open as partial (its arguments so far). The format is the mock's own on purpose: the engine must
 not know any package's.
 
 An image in a message takes IMAGE_TOKENS placeholder tokens (IMG); each step
@@ -180,8 +180,11 @@ class MockToolsRuntime:
                 break
             content.append(text[pos:start])
             end = text.find(CLOSE, start)
-            if end < 0:
-                break  # an open call: nothing after it is known yet
+            if end < 0:  # an open call: nothing after it is known yet
+                name, space, args = text[start + len(OPEN):].partition(" ")
+                if not final and space:  # its name is whole: what it has so far
+                    calls.append({"name": name, "arguments": args.rstrip(CLOSE[0]), "partial": True})
+                break
             name, _, args = text[start + len(OPEN):end].partition(" ")
             calls.append({"name": name, "arguments": args or "{}"})
             pos = end + len(CLOSE)

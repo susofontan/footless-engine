@@ -303,6 +303,13 @@ class Checker:
         assert ids, "chat() with tools returned no ids"
         content, calls = self.engine.tool_calls("A plain answer.", tools, True)
         assert isinstance(content, str) and isinstance(calls, list), "tool_calls() shape"
+        # read as it streams: each result extends the previous one
+        text, before = "A plain answer.", ""
+        for n in range(1, len(text) + 1):
+            content, calls = self.engine.tool_calls(text[:n], tools, n == len(text))
+            assert content.startswith(before), f"the content of {text[:n]!r} drops what was read"
+            assert not calls, f"a call read in {text[:n]!r}"
+            before = content
 
     def speculative(self):
         if "speculative" not in self.engine.facts.capabilities:

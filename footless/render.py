@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .sdk import ContractError
+
 
 @dataclass
 class LogprobRow:
@@ -228,8 +230,10 @@ class ToolCalls:
 
     `parse(text, final) -> (content, calls)` is the package's own reading of
     its call format (the `tool_calls` verb, the request's tools bound). Content
-    leaves as soon as the package says no call can claim it, and a call leaves
-    whole once the package reads it complete. As in vLLM, content that is all
+    leaves as soon as the package says no call can claim it. A call leaves as
+    vLLM streams one: its name first, then its arguments as they grow -- a
+    call the package lists while still `partial` sends what it has, one it
+    lists only once complete sends them whole. As in vLLM, content that is all
     whitespace waits for what follows it: it is dropped when a call does, kept
     otherwise. `limit` keeps only the first calls (`parallel_tool_calls`).
     """
@@ -239,24 +243,43 @@ class ToolCalls:
         self._limit = limit
         self._text = ""
         self._sent = 0  # content characters handed out (or dropped)
+        self._args: list[str] = []  # each call's arguments handed out so far
         self.content = ""  # the content as last read
-        self.calls: list[dict] = []  # the calls as last read
+        self.calls: list[dict] = []  # the complete calls as last read
 
-    def push(self, text: str) -> tuple[str, list[tuple[int, dict]]]:
-        """More answer text: the content and the (index, call)s now safe."""
+    def push(self, text: str) -> tuple[str, list[tuple[int, str | None, str]]]:
+        """More answer text: the content now safe, and the calls' news as
+        (index, name -- for a call not seen before, else None -- , more arguments)."""
         self._text += text
         return self._read(final=False)
 
-    def close(self) -> tuple[str, list[tuple[int, dict]]]:
+    def close(self) -> tuple[str, list[tuple[int, str | None, str]]]:
         """The answer is over: whatever is left."""
         return self._read(final=True)
 
-    def _read(self, final: bool) -> tuple[str, list[tuple[int, dict]]]:
+    def _read(self, final: bool):
         content, calls = self._parse(self._text, final)
         if self._limit is not None:
             calls = calls[: self._limit]
-        known = len(self.calls)
-        self.content, self.calls = content, list(calls)
+        if any(c.get("partial") for c in calls[:-1]) or (final and calls and calls[-1].get("partial")):
+            raise ContractError("tool_calls: only the last call of an unfinished answer may be partial")
+        if len(calls) < len(self._args):
+            raise ContractError("tool_calls: a call already read is gone")
+        news = []
+        for i, call in enumerate(calls):
+            args = call["arguments"]
+            if i == len(self._args):
+                self._args.append("")
+                news.append((i, call["name"], ""))
+            sent = self._args[i]
+            if not args.startswith(sent):
+                raise ContractError(f"tool_calls: call {i}'s arguments {args!r} "
+                                    f"do not extend what was read before ({sent!r})")
+            if len(args) > len(sent):
+                news.append((i, None, args[len(sent):]))
+                self._args[i] = args
+        self.content = content
+        self.calls = [c for c in calls if not c.get("partial")]
         fresh = content[self._sent:]
         if not content.strip():  # nothing but whitespace so far
             if calls:
@@ -265,4 +288,4 @@ class ToolCalls:
             elif not final:
                 fresh = ""  # held
         self._sent += len(fresh)
-        return fresh, list(enumerate(self.calls))[known:]
+        return fresh, news

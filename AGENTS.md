@@ -127,6 +127,9 @@ gates, and correctness gates come before speed. Then:
   `ImageSpan`s), `StepItem.images`; an `Image` is the file's bytes and their
   sha256, which keys the prefix cache; the API reads base64 data URLs only
   (2026-10-07).
+- A stream carries a tool call as vLLM's does (id and name, then the
+  arguments as they grow); `tool_calls` may list the call still being written
+  as `partial`, its arguments a prefix of the complete call's (2026-10-07).
 
 ## Not yet decided
 

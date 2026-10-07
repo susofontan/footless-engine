@@ -830,7 +830,13 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(status, 200)
         deltas = [e["choices"][0] for e in events if e and e["choices"]]
         content = "".join(d["delta"].get("content") or "" for d in deltas)
-        calls = [c for d in deltas for c in d["delta"].get("tool_calls", [])]
+        calls = []  # put together as a client does: a call's first delta, then its arguments
+        for piece in (c for d in deltas for c in d["delta"].get("tool_calls", [])):
+            if piece["index"] == len(calls):
+                calls.append(json.loads(json.dumps(piece)))
+            else:
+                self.assertEqual(set(piece), {"index", "function"})
+                calls[piece["index"]]["function"]["arguments"] += piece["function"]["arguments"]
         return content, calls, deltas[-1]["finish_reason"]
 
     def test_a_call_comes_back_as_tool_calls(self):
@@ -879,6 +885,20 @@ class ToolsTest(unittest.TestCase):
                                                 "arguments": '{"city": "Lugo"}'})
         self.assertTrue(calls[0]["id"].startswith("chatcmpl-tool-"))
         self.assertEqual(finish, "tool_calls")
+
+    def test_a_call_streams_as_vllm_streams_one(self):
+        """Its id and name with empty arguments first, then the arguments in
+        pieces as the answer writes them; no content alongside."""
+        self.runtime.script = '[[get_weather {"city": "Lugo", "days": 3}]]'
+        status, events = self.api.stream("/v1/chat/completions", {
+            "messages": [{"role": "user", "content": "hi"}], "tools": [WEATHER], "stream": True})
+        pieces = [d["tool_calls"][0] for e in events if e and e["choices"]
+                  for d in [e["choices"][0]["delta"]] if "tool_calls" in d]
+        self.assertEqual(set(pieces[0]), {"id", "type", "index", "function"})
+        self.assertEqual(pieces[0]["function"], {"name": "get_weather", "arguments": ""})
+        self.assertGreater(len(pieces), 3, "the arguments arrive in pieces")
+        self.assertEqual("".join(p["function"]["arguments"] for p in pieces[1:]),
+                         '{"city": "Lugo", "days": 3}')
 
     def test_parallel_tool_calls_false_keeps_the_first(self):
         script = "[[get_weather {}]][[get_time {}]]"

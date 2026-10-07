@@ -241,8 +241,10 @@ LABEL_LOGPROBS = "label_logprobs"
 # `text` is the answer so far (outside any thinking block); the result is its
 # plain content and the calls it makes, each {"name": str, "arguments": str}
 # (JSON text), in order. With `final` false the text may still grow: content
-# stops short of anything that may yet open a call, and only calls already
-# complete are listed — each result extends the previous one.
+# stops short of anything that may yet open a call, and the last call listed
+# may be one still being written, marked "partial": True, its arguments so far
+# a prefix of the complete call's — each result extends the previous one. The
+# engine streams a call as vLLM does: its name, then its arguments as they grow.
 TOOL_CALLS = "tool_calls"
 
 
