@@ -637,6 +637,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        # read before any refusal: a body left unread on a kept-alive
+        # connection would be taken for the next request's first line
+        length = self.headers.get("content-length")
+        try:
+            body = None if length is None else self.rfile.read(int(length))
+        except ValueError:
+            self.close_connection = True
+            return self._send_json(400, wire.error("invalid Content-Length"))
         if path not in ("/v1/chat/completions", "/v1/completions",
                         "/v1/decisions", "/v1/systemone"):
             return self._not_found(path)
@@ -646,9 +654,8 @@ class _Handler(BaseHTTPRequestHandler):
                 != "application/json":
             return self._send_json(400, wire.error(
                 "Unsupported Media Type: Only 'application/json' is allowed"))
-        body = self._body()
         if body is None:
-            return
+            return self._send_json(400, wire.error("a body with Content-Length is required"))
         try:
             payload = json.loads(body)
             if not isinstance(payload, dict):
@@ -759,16 +766,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- plumbing ----------------------------------------------------------
 
-    def _body(self) -> bytes | None:
-        length = self.headers.get("content-length")
-        if length is None:
-            self._send_json(400, wire.error("a body with Content-Length is required"))
-            return None
+    def handle(self) -> None:
         try:
-            return self.rfile.read(int(length))
-        except ValueError:
-            self._send_json(400, wire.error("invalid Content-Length"))
-            return None
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            pass  # the client hung up on a kept-alive connection: nothing to answer
 
     def _authorized(self, path: str) -> bool:
         front = getattr(self.server, "front", None)

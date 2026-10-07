@@ -335,6 +335,27 @@ class ServeTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["choices"][0]["message"]["content"], SCRIPT_TEXT)
 
+    def test_a_refused_post_leaves_its_connection_clean(self):
+        """A 404 on a kept-alive connection reads its body: the next request
+        on that connection is read from its own first line."""
+        import http.client
+        from urllib.parse import urlsplit
+
+        split = urlsplit(self.api.base)
+        conn = http.client.HTTPConnection(split.hostname, split.port, timeout=30)
+        self.addCleanup(conn.close)
+        head = {"Content-Type": "application/json"}
+        conn.request("POST", "/v1/embeddings", json.dumps({"input": "test"}), head)
+        response = conn.getresponse()
+        response.read()
+        self.assertEqual(response.status, 404)
+        conn.request("POST", "/v1/chat/completions",
+                     json.dumps({"messages": [{"role": "user", "content": "hi"}]}), head)
+        response = conn.getresponse()
+        body = json.loads(response.read())
+        self.assertEqual(response.status, 200)
+        self.assertEqual(body["choices"][0]["message"]["content"], SCRIPT_TEXT)
+
     # -- what the engine refuses ------------------------------------------
 
     def test_a_prompt_over_the_context_is_a_400(self):
