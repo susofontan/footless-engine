@@ -20,6 +20,10 @@ already compares the manifest with the runtime's facts (rule 3). What follows:
   capabilities       label_logprobs, tool_calls and speculative, when declared
                      (speculation must not change one token)
   accounting         everything freed, the ledger is back to zero
+  vision             when declared (last: turning it on may keep a claim):
+                     chat_images' tokens and spans, greedy determinism with an
+                     image, an image split over two steps = fed in one, the
+                     ledger back to where vision left it
 
 Exit status 0 when nothing failed. A WARN is not a contract breach but costs
 something (a lossy round trip refuses label scoring; no cache reuse is slow).
@@ -37,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from footless.engine import DEFAULT_BUDGET, Engine, StepContext  # noqa: E402
 from footless.sdk import (  # noqa: E402
-    LABEL_LOGPROBS, TOOL_CALLS, BudgetRefused, ContractError, SamplingSpec, StepItem,
+    LABEL_LOGPROBS, TOOL_CALLS, VISION, Image, ImageSpan, BudgetRefused, ContractError, SamplingSpec, StepItem,
 )
 
 GREEDY = SamplingSpec(temperature=0.0, top_k=1, top_p=1.0, seed=1)
@@ -308,12 +312,58 @@ class Checker:
         want = self.reference_long
         assert got == want, "speculation changed the tokens"
 
+    def vision(self):
+        if VISION not in self.engine.facts.capabilities:
+            raise Skip("not declared")
+        self.engine.vision(True)
+        used = getattr(self.engine.services.accounting, "used", 0)
+        a, b = Image.of(_png(64, 48, (200, 30, 30))), Image.of(_png(64, 48, (30, 30, 200)))
+        prompts = [self.engine.chat_prompt([{"role": "user", "content": [
+            {"type": "image", "image": im}, {"type": "text", "text": "What colour is this?"}]}]) for im in (a, b)]
+        for p in prompts:
+            assert len(p.images) == 1, "chat_images placed one image"
+            sp = p.images[0]
+            assert 0 <= sp.start and sp.length > 0 and sp.start + sp.length <= len(p.tokens), "span outside the prompt"
+        p = prompts[0]
+        sp = p.images[0]
+
+        def run(cut):
+            st = self.state()
+            for lo, hi in ((0, cut), (cut, len(p.tokens))):
+                if lo == hi:
+                    continue
+                spans = [ImageSpan(sp.start - lo, sp.length, sp.image)]
+                first = self.rt.step([StepItem(st, p.tokens[lo:hi], GREEDY if hi == len(p.tokens) else None,
+                                               spans)], self.ctx)[0].token
+            out = [first] + self.decode(st)
+            self.free(st)
+            return out
+        whole = run(len(p.tokens))
+        assert run(len(p.tokens)) == whole, "greedy with an image is not deterministic"
+        assert run(sp.start + sp.length // 2) == whole, "an image split over two steps differs from one"
+        left = getattr(self.engine.services.accounting, "used", 0)
+        assert left == used, f"{left - used} bytes still claimed after the states were freed"
+        return f"{sp.length} tokens an image"
+
     def accounting(self):
         for st in list(self.states):
             self.free(st)
         self.engine.cache.free_all()
         used = getattr(self.engine.services.accounting, "used", 0)
         assert used == 0, f"{used} bytes still claimed after every state was freed"
+
+
+def _png(w: int, h: int, rgb: tuple[int, int, int]) -> bytes:
+    """A small PNG: a colour square on white (stdlib only)."""
+    import struct
+    import zlib
+    rows = b"".join(b"\0" + b"".join(bytes(rgb) if w // 4 <= x < 3 * w // 4 and h // 4 <= y < 3 * h // 4
+                                       else b"\xff\xff\xff" for x in range(w)) for y in range(h))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -361,6 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         c.check("tool_calls", c.tool_calls)
         c.check("speculative", c.speculative)
         c.check("accounting back to zero", c.accounting)
+        c.check("vision", c.vision)
     finally:
         engine.close()
     print(f"{'FAILED' if c.failed else 'OK'}: {c.failed} check(s) failed")

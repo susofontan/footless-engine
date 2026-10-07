@@ -1,23 +1,29 @@
-"""A scripted mock with function tools: the plain mock plus the `tool_calls`
-capability.
+"""A scripted mock with function tools and images: the plain mock plus the
+`tool_calls` and `vision` capabilities.
 
 Its template writes the tools it is given into the prompt (and records each
 render in `chats`), and it answers with `script`, a text a test sets. A call
 in that text is `[[NAME ARGS]]`, ARGS being JSON text; the `tool_calls` verb
 reads them back out. The format is the mock's own on purpose: the engine must
 not know any package's.
+
+An image in a message takes IMAGE_TOKENS placeholder tokens (IMG); each step
+records the images it was given (`steps_images`: (tokens before, start,
+length, digest) per span).
 """
 
 from __future__ import annotations
 
 import json
 
-from footless.sdk import BudgetRefused, ContractError, Claim, Facts, Services, State, StepContext, StepItem, StepResult
+from footless.sdk import (BudgetRefused, ContractError, Claim, Facts, ImageSpan, Services, State, StepContext,
+                          StepItem, StepResult)
 
 BPT = 8  # bytes per cached token
 MAX_BATCH = 4  # most items one step carries (the manifest's max_batch)
 EOS = 256
 OPEN, CLOSE = "[[", "]]"
+IMG, IMAGE_TOKENS = 300, 3
 
 
 class _State:
@@ -32,11 +38,13 @@ class MockToolsRuntime:
         self.services: Services | None = None
         self.chats: list[dict] = []  # what each chat() call was asked for
         self.script = "the mock model speaks"
+        self.vision = False
+        self.steps_images: list[tuple[int, int, int, str]] = []
 
     def open(self, model_dir: str, services: Services) -> Facts:
         self.services = services
         return Facts(cache_bytes_per_token=BPT, max_batch=MAX_BATCH, max_context=256,
-                     capabilities=["tool_calls"], stop_tokens=[EOS])
+                     capabilities=["tool_calls", "vision"], stop_tokens=[EOS])
 
     def close(self) -> None:
         pass
@@ -86,6 +94,29 @@ class MockToolsRuntime:
         text = "".join(f"{m['role']}: {m['content']}\n" for m in messages)
         return self.encode(head + text + "assistant: ")
 
+    # the OPTIONAL verbs behind `vision`
+    def set_vision(self, enabled: bool) -> None:
+        self.vision = enabled
+
+    def chat_images(self, messages: list[dict], thinking: bool = True,
+                    tools: list | None = None) -> tuple[list[int], list[ImageSpan]]:
+        if not self.vision:
+            raise ContractError("chat_images before set_vision(True)")
+        self.chats.append({"messages": messages, "tools": tools})
+        tokens = self.encode("".join(f"tool: {t['function']['name']}\n" for t in tools or ()))
+        spans = []
+        for m in messages:
+            tokens += self.encode(f"{m['role']}: ")
+            parts = m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]
+            for part in parts:
+                if part["type"] == "image":
+                    spans.append(ImageSpan(len(tokens), IMAGE_TOKENS, part["image"]))
+                    tokens += [IMG] * IMAGE_TOKENS
+                else:
+                    tokens += self.encode(part["text"])
+            tokens += self.encode("\n")
+        return tokens + self.encode("assistant: "), spans
+
     def _claim_first(self, batch: list[StepItem]) -> None:
         """The batch's own rules (at most max_batch items, a state once), then
         every item's bytes claimed before any state moves: a refusal leaves the
@@ -119,6 +150,10 @@ class MockToolsRuntime:
         results = []
         for item in batch:
             state = item.state
+            for span in item.images:
+                if not self.vision:
+                    raise ContractError("images in a step before set_vision(True)")
+                self.steps_images.append((len(state.tokens), span.start, span.length, span.image.digest))
             state.tokens.extend(item.input_tokens)
             state.fed += len(item.input_tokens)
             if item.sampling is None:

@@ -14,12 +14,14 @@ model — exactly the validations vLLM runs too.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from .sdk import Image
 from .decisions import QuestionView, check_option_names, choice_confidence, score_confidence
 
 INT64 = (-(2**63), 2**63 - 1)
@@ -591,26 +593,58 @@ def _tools(body: dict, dropped: list[str]) -> tuple[list[dict] | None, bool, boo
 # -- messages --------------------------------------------------------------
 
 
-def _content(raw, param: str, dropped: list[str]) -> str:
+def _content(raw, param: str, dropped: list[str], vision: bool = False):
+    """A message's content: its text, or -- with image input on and images
+    among its parts -- the parts as templates take them: {"type": "text",
+    "text"} and {"type": "image", "image": sdk.Image}, in order."""
     if raw is None:
         return ""
     if isinstance(raw, str):
         return raw
     if isinstance(raw, list):
         out = []
-        for part in raw:
+        for index, part in enumerate(raw):
             if isinstance(part, str):
-                out.append(part)
+                out.append({"type": "text", "text": part})
             elif isinstance(part, dict) and part.get("type") == "text":
-                out.append(_string(part.get("text"), f"{param} text"))
+                out.append({"type": "text", "text": _string(part.get("text"), f"{param} text")})
+            elif vision and isinstance(part, dict) and part.get("type") == "image_url":
+                out.append({"type": "image", "image": _image(part.get("image_url"), f"{param}[{index}].image_url")})
             else:
                 kind = part.get("type", "unknown") if isinstance(part, dict) else "unknown"
-                dropped.append(f"{param} {kind}")  # the packages are text-only
-        return "".join(out)
+                dropped.append(f"{param} {kind}")  # not read: no image input (--vision)
+        if not any(p["type"] == "image" for p in out):
+            return "".join(p["text"] for p in out)
+        merged = []                        # neighbouring text parts as one
+        for p in out:
+            if p["type"] == "text" and merged and merged[-1]["type"] == "text":
+                merged[-1] = {"type": "text", "text": merged[-1]["text"] + p["text"]}
+            else:
+                merged.append(p)
+        return merged
     raise ApiError(f"{param} must be a string or a list of content parts", param=param)
 
 
-def _messages(body: dict, dropped: list[str]) -> list[dict]:
+def _image(raw, param: str) -> Image:
+    """An image_url part's image: a data URL with base64 bytes (URLs are not
+    fetched)."""
+    url = raw.get("url") if isinstance(raw, dict) else raw
+    if not isinstance(url, str):
+        raise ApiError(f"{param} must hold a url", param=param)
+    head, sep, data = url.partition(",")
+    if not (url.startswith("data:") and sep and head.endswith(";base64")):
+        raise ApiError(f"{param}: only data URLs with base64 image bytes are read "
+                       "(data:image/png;base64,...); URLs are not fetched", param=param)
+    try:
+        payload = base64.b64decode(data, validate=True)
+    except ValueError as exc:
+        raise ApiError(f"{param}: invalid base64 ({exc})", param=param) from None
+    if not payload:
+        raise ApiError(f"{param}: empty image", param=param)
+    return Image.of(payload)
+
+
+def _messages(body: dict, dropped: list[str], vision: bool = False) -> list[dict]:
     raw = body.get("messages")
     if not isinstance(raw, list) or not raw:
         raise ApiError("messages must be a non-empty list", param="messages")
@@ -622,7 +656,7 @@ def _messages(body: dict, dropped: list[str]) -> list[dict]:
         role = _string(item.get("role"), f"{param}.role")
         role = "system" if role == "developer" else role
         message = {"role": role,
-                   "content": _content(item.get("content"), f"{param}.content", dropped)}
+                   "content": _content(item.get("content"), f"{param}.content", dropped, vision)}
         for key, value in item.items():
             if key not in ("role", "content"):
                 message[key] = value  # the contract passes other keys to the template
@@ -732,7 +766,7 @@ def _reasoning(body: dict, levels, dropped: list[str]) -> tuple[bool, str | None
     return True, effort
 
 
-def parse_chat(body: dict, names, capabilities, levels=()) -> ChatRequest:
+def parse_chat(body: dict, names, capabilities, levels=(), vision: bool = False) -> ChatRequest:
     # function tools are served by a package that declares `tool_calls`, and
     # dropped (reported) by any other
     served = ("tools", "tool_choice") if "tool_calls" in capabilities else ()
@@ -751,7 +785,7 @@ def parse_chat(body: dict, names, capabilities, levels=()) -> ChatRequest:
     truncation = _truncation(body)
     return ChatRequest(
         model=_model(body, names),
-        messages=_messages(body, dropped),
+        messages=_messages(body, dropped, vision),
         n=tail["n"],
         max_tokens=max_tokens,
         sampling=sampling,

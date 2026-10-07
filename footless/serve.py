@@ -174,10 +174,15 @@ class FrontEnd:
         if isinstance(request, (wire.DecisionsRequest, wire.SystemOneRequest)):
             return self._run_decisions(job, request)
         prompts: list[tuple[list[int], str]] = []  # (token ids, echoed text)
+        images = []                                 # where the chat prompt's images sit
         if isinstance(request, wire.ChatRequest):
-            tokens = self.engine.chat_tokens(request.messages, request.thinking,
+            prompt = self.engine.chat_prompt(request.messages, request.thinking,
                                              request.level, request.tools)
-            prompts.append((self._fit(tokens, request), ""))
+            tokens, images = self._fit(prompt.tokens, request), prompt.images
+            if images and len(tokens) != len(prompt.tokens):
+                raise wire.ApiError("truncate_prompt_tokens would cut a prompt that carries images",
+                                    param="truncate_prompt_tokens")
+            prompts.append((tokens, ""))
         else:
             for prompt in request.prompts:
                 tokens = prompt.ids if prompt.ids is not None \
@@ -199,7 +204,7 @@ class FrontEnd:
             for _ in range(request.n):
                 output, finish, got, rows, calls = yield from self._one_choice(
                     job, request, prompt_ids, echo, spec, max_tokens, usage,
-                    response_id, created, index,
+                    response_id, created, index, images,
                 )
                 cached = max(cached, got)  # the choices share the prompt's cache
                 choices.append(self._choice(request, output, rows, echo, index,
@@ -222,7 +227,7 @@ class FrontEnd:
 
     def _one_choice(self, job: _Job, request, prompt_ids: list[int], echo: str,
                     spec: SamplingSpec, max_tokens: int, usage: _Usage,
-                    response_id: str, created: int, index: int):
+                    response_id: str, created: int, index: int, images=()):
         """One generation; its deltas stream out as they become safe."""
         # the fact describes the thinking mode: a prompt rendered outside it —
         # or a raw completion, which no template rendered — starts outside a block
@@ -273,7 +278,7 @@ class FrontEnd:
             return stop
 
         result = yield from self.engine.sequence(
-            prompt_ids, max_tokens, sampling=spec, on_step=on_step, ctx=job.ctx,
+            prompt_ids, max_tokens, sampling=spec, on_step=on_step, ctx=job.ctx, images=images,
         )
         pieces, fresh = output.close()
         rows.extend(fresh)
@@ -655,7 +660,8 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/v1/chat/completions":
                 request = wire.parse_chat(payload, {front.model_name},
                                           front.engine.facts.capabilities,
-                                          front.engine.facts.thinking_levels)
+                                          front.engine.facts.thinking_levels,
+                                          vision=front.engine.vision_on)
             elif path == "/v1/completions":
                 request = wire.parse_completions(payload, {front.model_name},
                                                  front.engine.facts.capabilities)

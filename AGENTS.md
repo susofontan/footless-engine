@@ -122,10 +122,15 @@ gates, and correctness gates come before speed. Then:
   runs again without its youngest request, which waits in the prefix cache
   (2026-10-05).
 
+- Images cross the contract behind the `vision` capability, on only when the
+  operator asks (`serve --vision`): `set_vision`, `chat_images` (prompt ids and
+  `ImageSpan`s), `StepItem.images`; an `Image` is the file's bytes and their
+  sha256, which keys the prefix cache; the API reads base64 data URLs only
+  (2026-10-07).
+
 ## Not yet decided
 
-Automatic hardware detection (the CLI takes `--backend`), multimodal input
-(how images or audio would cross the contract), stop strings inside the
-runtime, the repository layout beyond the above, and anything `CONTRACT.md`
+Automatic hardware detection (the CLI takes `--backend`), audio and video
+input, stop strings inside the runtime, the repository layout beyond the above, and anything `CONTRACT.md`
 marks as not covered. Do not assume them; when one is decided,
 record it above in one line.

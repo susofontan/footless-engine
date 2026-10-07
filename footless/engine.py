@@ -14,6 +14,8 @@ from .manifest import Manifest, read as read_manifest, verify, verify_backends
 from .sdk import (
     LABEL_LOGPROBS,
     TOOL_CALLS,
+    VISION,
+    ImageSpan,
     RUNTIME_METHODS,
     BudgetRefused,
     Claim,
@@ -389,6 +391,20 @@ class Timing:
 
 
 @dataclass
+class Prompt:
+    """A conversation as the model reads it: tokens, and where its images sit."""
+
+    tokens: list[int]
+    images: list[ImageSpan]
+
+
+def _images_in(message: dict) -> bool:
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(p, dict) and p.get("type") == "image" for p in content)
+
+
+@dataclass
 class GenerationResult:
     text: str
     tokens: list[int]
@@ -425,6 +441,7 @@ class Engine:
         # set by a Batcher before it resumes its sequences: is more than one
         # request admitted (a prefill then shares its steps; `sequence`)
         self._sharing = False
+        self.vision_on = False   # images read: asked for by the operator (Engine.vision)
 
     @classmethod
     def open(
@@ -461,6 +478,26 @@ class Engine:
             self.runtime.encode(prompt), max_tokens, on_token, sampling,
             loop_guard=loop_guard,
         )
+
+    def vision(self, enabled: bool = True) -> None:
+        """Turn image input on, if this package reads images (capability
+        `vision`). Like `speculative`, the operator asks for it; a package that
+        does not declare the capability is refused with the reason, and one
+        that declares it without its verbs is a reported contradiction. What
+        reading images loads is the package's business (it may claim from
+        `accounting`)."""
+        if not enabled:
+            return
+        if VISION not in self.facts.capabilities:
+            raise ContractError(
+                "image input was asked for, but this package declares no vision "
+                f"capability (it declares: {self.facts.capabilities or 'nothing'})")
+        for name in ("set_vision", "chat_images"):
+            if not callable(getattr(self.runtime, name, None)):
+                raise ContractError(
+                    f"this package declares the vision capability but its runtime exposes no {name} verb")
+        self.runtime.set_vision(True)
+        self.vision_on = True
 
     def speculative(self, enabled: bool = True) -> None:
         """Turn speculative decoding on, if this package offers it.
@@ -599,6 +636,26 @@ class Engine:
         self.cache.store(head, state)
         return result
 
+    def chat_prompt(self, messages: list[dict], thinking: bool = True,
+                    level: str | None = None, tools: list[dict] | None = None) -> "Prompt":
+        """`chat_tokens` for a conversation that may carry images (content
+        parts {"type": "image", "image": sdk.Image}): the tokens and where
+        each image sits among them, rendered by the package (`chat_images`,
+        behind `vision`, which must be on)."""
+        if not any(_images_in(m) for m in messages):
+            return Prompt(self.chat_tokens(messages, thinking, level, tools), [])
+        if not self.vision_on:
+            raise ContractError("the conversation carries images, but image input is not on "
+                                "(the operator turns it on: --vision)")
+        kwargs = {}
+        if level is not None:
+            kwargs["level"] = level
+        if tools:
+            self._tool_gate()
+            kwargs["tools"] = tools
+        tokens, spans = self.runtime.chat_images(messages, thinking, **kwargs)
+        return Prompt(list(tokens), list(spans))
+
     def chat_tokens(self, messages: list[dict], thinking: bool = True,
                     level: str | None = None, tools: list[dict] | None = None) -> list[str]:
         """The conversation as prompt tokens, via the package's own template.
@@ -609,6 +666,8 @@ class Engine:
         when set, so a runtime written before the parameter keeps serving
         requests that do not use it.
         """
+        if any(_images_in(m) for m in messages):
+            raise ValueError("a conversation with images becomes a prompt through chat_prompt")
         kwargs = {}
         if level is not None:
             kwargs["level"] = level
@@ -644,6 +703,7 @@ class Engine:
         self, tokens: list[int], max_tokens: int = DEFAULT_MAX_TOKENS,
         on_token=None, sampling: SamplingSpec | None = None,
         on_step=None, ctx: StepContext | None = None, loop_guard: bool | str = "exact",
+        images: list[ImageSpan] = (),
     ) -> GenerationResult:
         """One request: prefill `tokens`, then decode up to `max_tokens` tokens.
 
@@ -668,12 +728,13 @@ class Engine:
         The request runs alone: `sequence` driven by a `Batcher` of its own.
         """
         return Batcher(self).run(self.sequence(
-            tokens, max_tokens, on_token, sampling, on_step, ctx, loop_guard))
+            tokens, max_tokens, on_token, sampling, on_step, ctx, loop_guard, images))
 
     def sequence(
         self, tokens: list[int], max_tokens: int = DEFAULT_MAX_TOKENS,
         on_token=None, sampling: SamplingSpec | None = None,
         on_step=None, ctx: StepContext | None = None, loop_guard: bool | str = "exact",
+        images: list[ImageSpan] = (),
     ):
         """`generate_tokens` as a generator a `Batcher` drives beside others.
 
@@ -693,6 +754,17 @@ class Engine:
             raise ContractError(
                 f"prompt is {len(tokens)} tokens, max_context is {self.facts.max_context}"
             )
+        images = list(images)
+        if images and not self.vision_on:
+            raise ContractError("the prompt carries images, but image input is not on "
+                                "(the operator turns it on: --vision)")
+        # the prefix cache's key: an image's tokens are its placeholders, the
+        # same for every image -- each is keyed on the image's digest instead,
+        # so a cached state is reused only for the same images
+        keyed = list(tokens)
+        for span in images:
+            for j in range(span.length):
+                keyed[span.start + j] = (span.image.digest, j)
         # a prompt whose cache alone cannot fit the whole budget is refused now,
         # not after the minutes of prefill it takes to reach the limit (the
         # state's fixed part is the model's and not counted: this is the floor)
@@ -741,10 +813,10 @@ class Engine:
         while True:
             # what the state must hold before the next sample: the prompt, then
             # (after a preemption) the output so far
-            context = list(tokens) + generated
+            context = keyed + generated
             yield Admit(self.facts.cache_bytes_per_token * (len(context) + ADMIT_HEADROOM))
             state, matched = self.cache.lookup(context)
-            fed = context[matched:]
+            fed = (list(tokens) + generated)[matched:]
             taken = len(generated)          # output this admission adds is past here
             at = 0                          # of `fed`, forwarded so far
             try:
@@ -758,7 +830,10 @@ class Engine:
                     # is exactly zero output, and chunks before the last one never
                     # sample
                     sample = spec if last and max_tokens > len(generated) else None
-                    result, elapsed = yield Want(StepItem(state, chunk, sample), ctx)
+                    o = matched + at
+                    spans = [ImageSpan(sp.start - o, sp.length, sp.image) for sp in images
+                             if sp.start < o + len(chunk) and sp.start + sp.length > o]
+                    result, elapsed = yield Want(StepItem(state, chunk, sample, spans), ctx)
                     absorb(result)
                     # book the tokens that ran, not the tokens the request fed: a
                     # truncate can queue the kept prefix for re-forwarding inside

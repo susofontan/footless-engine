@@ -35,9 +35,9 @@ model), the **services** (model → engine).
 
 The capabilities defined so far are `logprobs` (top log-probabilities on step
 results), `speculative` (the package offers a drafter), `label_logprobs`
-(next-token label scoring at the answer position) and `tool_calls` (function
-tools rendered by `chat` and read back); the last three are reached through
-the optional verbs below.
+(next-token label scoring at the answer position), `tool_calls` (function
+tools rendered by `chat` and read back) and `vision` (the package reads
+images); the last four are reached through the optional verbs below.
 
 ## Runtime — engine → model
 
@@ -76,7 +76,7 @@ class Runtime(Protocol):
 
 Everything above is required: `Engine.open` fails on a runtime missing any of
 them. A small number of verbs are **optional**, are not in that list, and the
-engine reaches them only behind a declared capability. Today there are four:
+engine reaches them only behind a declared capability. Today there are six:
 
 | verb | capability | meaning |
 | --- | --- | --- |
@@ -84,6 +84,8 @@ engine reaches them only behind a declared capability. Today there are four:
 | `label_logprobs(input_tokens: list[int], labels: list[str]) -> list[tuple[int, float]]` | `label_logprobs` | each label resolved to the single token it adds at the answer position after `input_tokens`' text, returned with its full-vocabulary next-token log-probability, in the labels' order |
 | `label_logprobs_batch(items: list[tuple[list[int], list[str]]], state: State \| None = None) -> list[list[tuple[int, float]]]` | `label_logprobs` | `label_logprobs` for each (input_tokens, labels) pair, in order, from `state` when given; optional even behind the capability — without it the engine calls `label_logprobs` per pair |
 | `tool_calls(text: str, tools: list[dict], final: bool) -> tuple[str, list[dict]]` | `tool_calls` | the answer `text` as its content and the calls it makes (`{"name", "arguments"}`, arguments as JSON text); with `final` false the text may still grow, so content stops short of what may yet open a call and only complete calls are listed |
+| `set_vision(enabled: bool) -> None` | `vision` | loads (or drops) what reading images takes; the operator asks for it (`--vision`), after `open`, so it may claim from `accounting` |
+| `chat_images(messages: list[dict], thinking: bool = True) -> tuple[list[int], list[ImageSpan]]` | `vision` | `chat` for messages whose content may hold `{"type": "image", "image": Image}` parts: the prompt ids and where each image sits among them, in order (`level=` and `tools=` as for `chat`) |
 
 - The engine branches on the **capability**, never on the package. A package
   that does not declare `speculative` is refused when the switch is asked for,
@@ -164,7 +166,20 @@ SamplingSpec | None` — the package's own sampling defaults, its generation
 config: what a request that pins nothing runs under. None leaves them to the
 engine.
 
-`StepItem`: `state`, `input_tokens: list[int]`, `sampling: SamplingSpec | None`.
+`StepItem`: `state`, `input_tokens: list[int]`, `sampling: SamplingSpec | None`,
+`images: list[ImageSpan]` (empty unless `vision` is on).
+
+`Image`: `data: bytes` — the encoded file as the request sent it, opaque to
+the engine — and `digest`, the sha256 of the bytes: its identity.
+`ImageSpan`: `start`, `length`, `image` — the image takes `length` tokens
+from `start`. `chat_images` places them in the prompt; on a `StepItem` a span
+counts from `input_tokens[0]` (negative when the image began in an earlier
+step) and carries the whole image's length: every step that feeds some of an
+image's tokens carries the image. Its tokens are the model's placeholders,
+the same for every image, so the engine keys its prefix cache on the images'
+digests there: a cached state is reused only for the same images. Without
+`vision` on, the engine never sends one, and a conversation with images is
+refused.
 
 `StepResult`: `token: int | None`, `finished: bool`,
 `top_logprobs: list[tuple[int, float]] | None` (capability `logprobs`), and

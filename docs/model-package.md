@@ -85,6 +85,7 @@ its verb as a contract error.
 | `speculative` | `set_speculative(enabled)` | the same tokens as without it, bit for bit |
 | `label_logprobs` | `label_logprobs`, optionally `label_logprobs_batch` | scores at the answer position, generation untouched |
 | `tool_calls` | `tool_calls(text, tools, final)` | reads the calls the template's format writes |
+| `vision` | `set_vision(enabled)`, `chat_images(messages, ...)` | places each image's tokens in the prompt; a step reads the images its spans name (a span may begin in an earlier step); a state keeps its images (truncate, clone, export) |
 | `logprobs` | (on `StepResult.top_logprobs`) | the top log-probabilities of each sampled step |
 
 A step that hands out a token computed earlier (a verified draft) sets

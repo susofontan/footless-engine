@@ -75,7 +75,8 @@ package's own generation config. They end a generation whose tail repeats one
 span verbatim past all use (`--loop-guard exact`, the default; `--loop-guard`
 alone also ends near-copies; `--no-loop-guard` lets it run). `chat` takes
 `--no-thinking` and `--reasoning LEVEL`; `generate`, `chat` and `serve` take
-`--speculative` (alias `--mtp`) for packages that declare it.
+`--speculative` (alias `--mtp`) for packages that declare it; `serve` takes
+`--vision` (image input) for packages that declare `vision`.
 
 ## The rules
 

@@ -35,7 +35,10 @@ class CheckPackageTest(unittest.TestCase):
         report = self.run_on("mockup-thinking")
         self.assertRegex(report, r"PASS\s+label_logprobs")
         self.assertRegex(report, r"SKIP\s+tool_calls\s+not declared")
-        self.assertRegex(self.run_on("mockup-tools"), r"PASS\s+tool_calls")
+        tools = self.run_on("mockup-tools")
+        self.assertRegex(tools, r"PASS\s+tool_calls")
+        self.assertRegex(tools, r"PASS\s+vision")
+        self.assertRegex(report, r"SKIP\s+vision\s+not declared")
 
     def test_a_package_that_breaks_a_rule_fails(self):
         """A mock whose clone forgets the state is caught: the check has teeth."""

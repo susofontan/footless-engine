@@ -63,11 +63,39 @@ class SamplingSpec:
     frequency_penalty: float = 0.0  # minus this x times-seen, OUTPUT tokens only
 
 
+@dataclass(frozen=True)
+class Image:
+    """An image as a request sent it: the encoded file's bytes (PNG, JPEG, ...),
+    opaque to the engine. `digest` (sha256 of the bytes, hex) is its identity:
+    two images are the same input when their digests are equal."""
+
+    data: bytes
+    digest: str
+
+    @classmethod
+    def of(cls, data: bytes) -> "Image":
+        import hashlib
+        return cls(bytes(data), hashlib.sha256(data).hexdigest())
+
+
+@dataclass(frozen=True)
+class ImageSpan:
+    """Where an image sits among tokens: it takes `length` tokens from `start`."""
+
+    start: int
+    length: int
+    image: Image
+
+
 @dataclass
 class StepItem:
     state: State
     input_tokens: list[int]  # empty = decode; positions are never passed
     sampling: SamplingSpec | None = None  # None = prefill chunk, samples nothing
+    # the images whose tokens are among input_tokens (capability "vision"):
+    # `start` counts from input_tokens[0], negative when the image began in an
+    # earlier step; `length` is the whole image's
+    images: list[ImageSpan] = field(default_factory=list)
 
 
 @dataclass
@@ -216,3 +244,20 @@ LABEL_LOGPROBS = "label_logprobs"
 # stops short of anything that may yet open a call, and only calls already
 # complete are listed — each result extends the previous one.
 TOOL_CALLS = "tool_calls"
+
+
+# The one spelling of the `vision` capability: the package reads images.
+# Behind it, two OPTIONAL verbs:
+#
+#     set_vision(enabled: bool) -> None
+#         loads (or drops) what reading images takes; asked for by the
+#         operator (`--vision`), it may claim from `accounting`
+#     chat_images(messages: list[dict], thinking: bool = True, **kw)
+#         -> tuple[list[int], list[ImageSpan]]
+#
+# `chat_images` renders a conversation whose messages' content parts may be
+# {"type": "image", "image": Image}: the prompt tokens, as `chat` makes them,
+# and where each image sits among them (its tokens are the model's own
+# placeholders; their count is the model's business), in order. `level=` and
+# `tools=` reach it as they reach `chat`.
+VISION = "vision"

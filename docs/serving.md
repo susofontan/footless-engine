@@ -80,6 +80,16 @@ calls in a stream) with `finish_reason` `"tool_calls"`;
 named function needs constrained decoding, which the engine lacks: served as
 `"auto"` and reported in the log.
 
+## Images
+
+`serve --vision` turns image input on, for a package that declares `vision`
+(refused at start-up otherwise). Chat messages then read `image_url` parts
+whose url is a data URL with base64 bytes (`data:image/png;base64,...`); any
+other url is a 400 (URLs are not fetched). Without `--vision`, image parts are
+dropped and reported, like any part the engine cannot execute. A prompt with
+images is not cut by `truncate_prompt_tokens`, and a cached state is reused
+only for the same images (by their bytes' digest).
+
 ## Decisions
 
 `/v1/decisions` and `/v1/systemone` score typed questions (`choice`, `score`,

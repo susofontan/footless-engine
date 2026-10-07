@@ -119,7 +119,9 @@ class Runtime:
     def chat(self, messages: list[dict], thinking: bool = True) -> list[int]:
         """The conversation as prompt ids, through the model's own template.
         Add `level=` (behind `thinking_levels`) and `tools=` (behind
-        `tool_calls`) only when the package declares them."""
+        `tool_calls`) only when the package declares them. A package that
+        reads images (`vision`) adds `set_vision` and `chat_images`, and reads
+        `StepItem.images` (CONTRACT.md, Optional verbs)."""
         raise NotImplementedError
 
     # -- the step ------------------------------------------------------------------

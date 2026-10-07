@@ -24,6 +24,15 @@ def _add_speculative(parser) -> None:
     )
 
 
+def _add_vision(parser) -> None:
+    """`--vision`: image input, if the package declares the capability. Off by
+    default, like speculation: reading images loads what it takes (the
+    operator asks for it), and a server started without it does not read the
+    images a request sends (they are dropped and reported)."""
+    parser.add_argument("--vision", action="store_true",
+                        help="read images in chat requests, if the package declares the capability")
+
+
 def _add_sampling(parser) -> None:
     """The sampling knobs a request may pin; the rest take the package's own
     defaults (its generation config), then the engine's own."""
@@ -125,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--served-model-name", default=None,
                        help="model name the API answers to (default: the manifest's)")
     _add_speculative(serve)
+    _add_vision(serve)
     args = parser.parse_args(argv)
 
     try:
@@ -134,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         # measurement. On `serve` the flag is a process-wide default (2026-10-01):
         # every request runs under it.
         engine.speculative(getattr(args, "speculative", False))
+        engine.vision(getattr(args, "vision", False))
         try:
             if args.command == "generate":
                 for prompt in args.prompt:
