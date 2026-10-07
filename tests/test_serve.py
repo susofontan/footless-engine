@@ -900,6 +900,15 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual("".join(p["function"]["arguments"] for p in pieces[1:]),
                          '{"city": "Lugo", "days": 3}')
 
+    def test_a_stream_cut_inside_a_call_ends_with_length(self):
+        """max_tokens inside a call: what was read of it went out, the
+        stream ends with "length" and no error (as vLLM's)."""
+        script = '[[get_weather {"city": "Lugo", "days": 3}]]'
+        content, calls, finish = self.stream(script, max_tokens=len(script) - 8)
+        self.assertEqual(finish, "length")
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertTrue('{"city": "Lugo", "days": 3}'.startswith(calls[0]["function"]["arguments"]))
+
     def test_parallel_tool_calls_false_keeps_the_first(self):
         script = "[[get_weather {}]][[get_time {}]]"
         status, body = self.chat(script, parallel_tool_calls=False)

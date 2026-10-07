@@ -229,6 +229,14 @@ class ToolCallsTest(unittest.TestCase):
         with self.assertRaises(ContractError):
             calls.close()
 
+    def test_a_call_the_answer_ended_inside_is_dropped_at_the_end(self):
+        """max_tokens cut the answer in a call: its pieces went out, the
+        final read lists no call, and none is complete."""
+        calls = self.reader(("", [{"name": "f", "arguments": '{"a"', "partial": True}]), ("", []))
+        self.assertEqual(calls.push("x")[1], [(0, "f", ""), (0, None, '{"a"')])
+        self.assertEqual(calls.close()[1], [])
+        self.assertEqual(calls.calls, [])
+
     def test_a_partial_call_in_a_final_read_is_refused(self):
         calls = self.reader(("", [{"name": "f", "arguments": "{", "partial": True}]))
         with self.assertRaises(ContractError):

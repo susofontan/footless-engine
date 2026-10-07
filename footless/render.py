@@ -263,7 +263,8 @@ class ToolCalls:
             calls = calls[: self._limit]
         if any(c.get("partial") for c in calls[:-1]) or (final and calls and calls[-1].get("partial")):
             raise ContractError("tool_calls: only the last call of an unfinished answer may be partial")
-        if len(calls) < len(self._args):
+        if len(calls) < len(self._args) and not (final and len(calls) == len(self._args) - 1):
+            # (the final read lists complete calls: one the answer ended inside is gone)
             raise ContractError("tool_calls: a call already read is gone")
         news = []
         for i, call in enumerate(calls):
