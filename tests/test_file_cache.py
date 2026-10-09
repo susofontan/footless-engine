@@ -19,10 +19,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 from footless.cli import _caching, _size
-from footless.engine import Engine, FileCache
+from footless.engine import Admit, Engine, FileCache, Want
 from footless.sdk import ContractError
 
 MODEL = Path(__file__).resolve().parent / "mockup"
+
+
+def _state_of(runtime, tokens):
+    """A mock state holding `tokens`, all fed (as a saved prompt's is)."""
+    state = runtime.new_state()
+    state.tokens.extend(tokens)
+    state.fed = len(state.tokens)
+    return state
 
 
 class FileCacheTest(unittest.TestCase):
@@ -35,10 +43,7 @@ class FileCacheTest(unittest.TestCase):
         self.addCleanup(self.dir.cleanup)
 
     def _state(self, tokens):
-        state = self.engine.runtime.new_state()
-        state.tokens.extend(tokens)
-        state.fed = len(state.tokens)
-        return state
+        return _state_of(self.engine.runtime, tokens)
 
     def test_lru_drops_the_oldest_at_the_cap(self):
         entry = len(self.engine.runtime.export_state(self._state([1])))
@@ -89,6 +94,36 @@ class FileCacheTest(unittest.TestCase):
         (Path(self.dir.name) / f"{ident}.state").write_bytes(b"not a state")
         self.assertIsNone(cache.load([1]))
         self.assertFalse(cache.has([1]))
+
+
+class SentinelTest(unittest.TestCase):
+    """What a hit was cut back to, learned and then preferred."""
+
+    def test_a_cut_point_is_saved_and_beats_a_longer_partial_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine.open(MODEL, prefix_cache=(tmp, 1 << 20))
+            self.addCleanup(engine.close)
+            files = engine.cache.files
+            # an entry the next request only shares its first five tokens
+            # with: the hit is cut back to those five
+            files.save([1, 2, 3, 4, 5, 6, 7, 8, 9],
+                       _state_of(engine.runtime, [1, 2, 3, 4, 5, 6, 7, 8, 9]))
+            gen = engine.sequence([1, 2, 3, 4, 5, 9, 9], 4)
+            want = next(gen)
+            self.assertIsInstance(want, Admit)
+            while not isinstance(want, Want):
+                want = next(gen)     # a disk load's Waits, then the first Want
+            self.assertTrue(files.has([1, 2, 3, 4, 5]),
+                            "the cut point was not saved as a sentinel")
+            gen.close()
+            # a later request sharing seven tokens with the LONG entry and
+            # five with the sentinel: the clean sentinel wins (no truncate,
+            # no replay) over the longer partial match
+            got = files.match([1, 2, 3, 4, 5, 6, 7, 50], 0)
+            self.assertIsNotNone(got)
+            state, matched = got
+            self.assertEqual(matched, 5)
+            self.assertEqual(state.tokens, [1, 2, 3, 4, 5])
 
 
 class AcrossRunsTest(unittest.TestCase):

@@ -323,50 +323,70 @@ class FileCache:
         return self._import(tuple(key))
 
     def match(self, key, min_len: int = 0) -> tuple[State, int] | None:
-        """The saved state sharing the longest prefix with `key` -- more than
-        `min_len` tokens of it -- truncated to it, as (state, matched)."""
+        """The saved state sharing the best prefix with `key` -- more than
+        `min_len` tokens of it -- fitted to it, as (state, matched).
+
+        A CLEAN entry wins first (one whose whole key matches, so the fit
+        needs no `truncate_state` at all) and only then the longest: cutting
+        an imported state back re-forwards everything it keeps -- its blob
+        carries no snapshots to cut back to (CONTRACT.md) -- so the replay a
+        partial hit costs is unbounded and a hit that cannot cost one wins
+        at any length. Within a class the longest match wins. (The RAM tier
+        keeps longest-match: its truncates are snap-bounded.)"""
         key = tuple(key)
-        best, best_len = None, min_len
+        best, best_len, best_clean = None, 0, False
         for entry in self._entries:
             common = 0
             for a, b in zip(entry, key):
                 if a != b:
                     break
                 common += 1
-            if common > best_len:
-                best, best_len = entry, common
+            if common <= min_len:
+                continue
+            clean = len(entry) == common
+            if best is None or (clean, common) > (best_clean, best_len):
+                best, best_len, best_clean = entry, common, clean
         state = self._import(best) if best is not None else None
         if state is None:
             return None
-        self._runtime.truncate_state(state, best_len)
+        if not best_clean:
+            self._runtime.truncate_state(state, best_len)
         return state, best_len
 
     # -- save --------------------------------------------------------------------------
 
-    def save(self, key, state: State) -> None:
+    def save(self, key, state: State, owned: bool = False) -> None:
         """Keep `state` under `key`. A key already saved holds that same
-        state by construction: its entry is only refreshed as used."""
+        state by construction: its entry is only refreshed as used. With
+        `owned` the state is this cache's private copy (`clone_state`d for
+        it alone) and the cache frees it on every path -- saved or dropped;
+        without it the state is the caller's and only its exported bytes
+        move here."""
         key = tuple(key)
-        if key in self._entries:
-            self._touch(key)
-            return
         try:
-            blob = self._runtime.export_state(state)
-        except Exception as exc:  # noqa: BLE001 - a cache never fails a request
-            self._log("warning", f"state not saved: {exc}")
-            return
-        size = len(blob)
-        if size > self._max_bytes:
-            self._log("info", f"a state of {size} B does not fit the cache's "
-                              f"{self._max_bytes} B: not saved")
-            return
-        while self._total + size > self._max_bytes:
-            if not self._evict_lru():
-                break
-        ident = _ident(key)
-        if self._write(ident, key, blob):
-            self._entries[key] = (ident, size)
-            self._total += size
+            if key in self._entries:
+                self._touch(key)
+                return
+            try:
+                blob = self._runtime.export_state(state)
+            except Exception as exc:  # noqa: BLE001 - a cache never fails a request
+                self._log("warning", f"state not saved: {exc}")
+                return
+            size = len(blob)
+            if size > self._max_bytes:
+                self._log("info", f"a state of {size} B does not fit the cache's "
+                                  f"{self._max_bytes} B: not saved")
+                return
+            while self._total + size > self._max_bytes:
+                if not self._evict_lru():
+                    break
+            ident = _ident(key)
+            if self._write(ident, key, blob):
+                self._entries[key] = (ident, size)
+                self._total += size
+        finally:
+            if owned:
+                self._runtime.free_state(state)
 
     def _write(self, ident: str, key, blob: bytes) -> bool:
         """The key and then the blob, the blob renamed into place. A full
@@ -1039,6 +1059,20 @@ class Engine:
                     matched = len(keyed)
             if state is None:
                 state, matched = self.cache.lookup(context)
+            if self.cache.files is not None and 0 < matched < len(context) \
+                    and not self.cache.files.has(tuple(context[:matched])):
+                # what this hit was cut back to: the next turn usually
+                # diverges at exactly this cut point, and a state saved there
+                # starts it instead of re-forwarding the kept tail. The state
+                # IS context[:matched] now (the lookup truncated it); the copy
+                # is the cache's to save and free. No room for the copy, and
+                # the cut point is simply not learned.
+                try:
+                    kept = self.runtime.clone_state(state)
+                except BudgetRefused:
+                    kept = None
+                if kept is not None:
+                    self.cache.files.save(context[:matched], kept, owned=True)
             fed = (list(tokens) + generated)[matched:]
             taken = len(generated)          # output this admission adds is past here
             at = 0                          # of `fed`, forwarded so far
