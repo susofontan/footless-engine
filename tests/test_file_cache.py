@@ -14,12 +14,13 @@ from __future__ import annotations
 import errno
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from footless.cli import _caching, _size
-from footless.engine import Admit, Engine, FileCache, Want
+from footless.engine import COMPRESS, Admit, Engine, FileCache, Want
 from footless.sdk import ContractError
 
 MODEL = Path(__file__).resolve().parent / "mockup"
@@ -45,8 +46,14 @@ class FileCacheTest(unittest.TestCase):
     def _state(self, tokens):
         return _state_of(self.engine.runtime, tokens)
 
+    def _disk_size(self, tokens) -> int:
+        """What a saved state's blob costs on disk: the cap counts file
+        bytes, and blobs are stored zlib-compressed."""
+        return len(zlib.compress(
+            self.engine.runtime.export_state(self._state(tokens)), COMPRESS))
+
     def test_lru_drops_the_oldest_at_the_cap(self):
-        entry = len(self.engine.runtime.export_state(self._state([1])))
+        entry = self._disk_size([1])
         cache = FileCache(self.engine.runtime, self.dir.name, 2 * entry)
         keys = [[1], [2], [3]]
         for key in keys:
@@ -56,7 +63,7 @@ class FileCacheTest(unittest.TestCase):
         self.assertEqual(len(list(Path(self.dir.name).glob("*.state"))), 2)
 
     def test_a_hit_moves_its_entry_off_the_front(self):
-        entry = len(self.engine.runtime.export_state(self._state([1])))
+        entry = self._disk_size([1])
         cache = FileCache(self.engine.runtime, self.dir.name, 2 * entry)
         cache.save([1], self._state([1]))
         cache.save([2], self._state([2]))
@@ -94,6 +101,19 @@ class FileCacheTest(unittest.TestCase):
         (Path(self.dir.name) / f"{ident}.state").write_bytes(b"not a state")
         self.assertIsNone(cache.load([1]))
         self.assertFalse(cache.has([1]))
+
+    def test_a_saved_state_round_trips_and_the_file_is_compressed(self):
+        state = self._state([7] * 400)
+        cache = FileCache(self.engine.runtime, self.dir.name, 1 << 20)
+        cache.save([7] * 400, state)
+        (blob,) = Path(self.dir.name).glob("*.state")
+        self.assertLess(blob.stat().st_size,
+                        len(self.engine.runtime.export_state(state)),
+                        "a repetitive state stores smaller than its export")
+        back = cache.load([7] * 400)
+        self.assertIsNotNone(back)
+        self.assertEqual(self.engine.runtime.export_state(back),
+                         self.engine.runtime.export_state(state))
 
 
 class SentinelTest(unittest.TestCase):

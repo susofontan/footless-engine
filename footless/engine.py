@@ -10,6 +10,7 @@ import os
 import random
 import sys
 import time
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -42,6 +43,7 @@ DEFAULT_MAX_TOKENS = 16384
 # context's cache and this many tokens' worth more, for its state's fixed part
 # and its growth. Alone, a request is always admitted.
 ADMIT_HEADROOM = 8192
+COMPRESS = 1  # zlib level for saved-state blobs: cheap, and they compress well
 
 # The repetition guard: how long a repeating tail may run before it is a loop.
 # A model that collapses repeats one span of tokens verbatim until the budget
@@ -296,8 +298,9 @@ class FileCache:
     placeholders are its digest, as in `PrefixCache`).
 
     Each entry is `<sha256>.key` (its tokens) beside `<sha256>.state` (the
-    blob, written last and renamed into place, so a crash never leaves half
-    an entry). Order in `self._entries` is least-recently-used first: a hit
+    blob, zlib-compressed, written last and renamed into place, so a crash
+    never leaves half an entry). Order in `self._entries` is
+    least-recently-used first: a hit
     moves its entry to the end, and `save` drops the front while the cache is
     over `max_bytes` -- or while the filesystem has no room for the write. A
     cache never fails a request and never grows past its limit; a state that
@@ -372,6 +375,7 @@ class FileCache:
             except Exception as exc:  # noqa: BLE001 - a cache never fails a request
                 self._log("warning", f"state not saved: {exc}")
                 return
+            blob = zlib.compress(blob, COMPRESS)
             size = len(blob)
             if size > self._max_bytes:
                 self._log("info", f"a state of {size} B does not fit the cache's "
@@ -414,7 +418,7 @@ class FileCache:
             return None
         ident, _ = entry
         try:
-            blob = (self._path / f"{ident}.state").read_bytes()
+            blob = zlib.decompress((self._path / f"{ident}.state").read_bytes())
             state = self._runtime.import_state(blob)
         except BudgetRefused:
             self._log("info", "a saved state did not fit the budget: not used")
