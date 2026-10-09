@@ -73,6 +73,11 @@ to show orders of magnitude.
   measure the weather. Report both orders.
 - **Watch the clocks.** Sustained load throttles a hot card by ~10% or more;
   a cold one after idle runs slow. Record clock and temperature with results.
+- **An idle queue taxes its next step.** After ~3 s without a submission the
+  next command buffer waited ~1.3 s before the GPU started it (M3 Ultra): the
+  first token of every chat message that follows a human pause. Warm-ups
+  hide it -- measure after idle too, and keep a served runtime's queue warm
+  (an empty command buffer a second).
 - **Rebuild before you measure.** A stale compiled kernel measures the old
   code; key builds on source and flags.
 - **Check the arithmetic.** Shares of one shape applied to another, or byte
