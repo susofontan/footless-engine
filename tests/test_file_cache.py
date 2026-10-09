@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import errno
 import tempfile
+import threading
+import time
 import unittest
 import zlib
 from pathlib import Path
@@ -20,7 +22,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from footless.cli import _caching, _size
-from footless.engine import COMPRESS, Admit, Engine, FileCache, Want
+from footless.engine import COMPRESS, Admit, Engine, FileCache, Wait, Want
 from footless.sdk import ContractError
 
 MODEL = Path(__file__).resolve().parent / "mockup"
@@ -52,29 +54,38 @@ class FileCacheTest(unittest.TestCase):
         return len(zlib.compress(
             self.engine.runtime.export_state(self._state(tokens)), COMPRESS))
 
+    def _cache(self, max_bytes: int, log=None) -> FileCache:
+        cache = FileCache(self.engine.runtime, self.dir.name, max_bytes, log=log)
+        self.addCleanup(cache.close)
+        return cache
+
     def test_lru_drops_the_oldest_at_the_cap(self):
         entry = self._disk_size([1])
-        cache = FileCache(self.engine.runtime, self.dir.name, 2 * entry)
+        cache = self._cache(2 * entry)
         keys = [[1], [2], [3]]
         for key in keys:
             cache.save(key, self._state(key))
+        cache.flush()                      # saves land beside the model
         self.assertFalse(cache.has([1]))
         self.assertTrue(cache.has([2]) and cache.has([3]))
         self.assertEqual(len(list(Path(self.dir.name).glob("*.state"))), 2)
 
     def test_a_hit_moves_its_entry_off_the_front(self):
         entry = self._disk_size([1])
-        cache = FileCache(self.engine.runtime, self.dir.name, 2 * entry)
+        cache = self._cache(2 * entry)
         cache.save([1], self._state([1]))
         cache.save([2], self._state([2]))
+        cache.flush()
         cache.load([1])                    # [2] is the oldest now
         cache.save([3], self._state([3]))
+        cache.flush()
         self.assertTrue(cache.has([1]))
         self.assertFalse(cache.has([2]))
 
     def test_a_full_disk_evicts_until_the_write_fits(self):
-        cache = FileCache(self.engine.runtime, self.dir.name, 1 << 20)
+        cache = self._cache(1 << 20)
         cache.save([1], self._state([1]))
+        cache.flush()                      # [1] is on disk before the full disk
         real, writes = Path.write_bytes, []
 
         def flaky(path, data):
@@ -85,18 +96,21 @@ class FileCacheTest(unittest.TestCase):
 
         with mock.patch.object(Path, "write_bytes", flaky):
             cache.save([2], self._state([2]))
+            cache.flush()
         self.assertTrue(cache.has([2]))
         self.assertFalse(cache.has([1]))   # the oldest made room
 
     def test_a_state_over_the_cap_is_not_saved(self):
-        cache = FileCache(self.engine.runtime, self.dir.name, 4)
+        cache = self._cache(4)
         cache.save([1, 2, 3, 4, 5], self._state([1, 2, 3, 4, 5]))
+        cache.flush()
         self.assertFalse(cache.has([1, 2, 3, 4, 5]))
         self.assertEqual(list(Path(self.dir.name).glob("*.state")), [])
 
     def test_an_unreadable_entry_is_a_miss_and_is_dropped(self):
-        cache = FileCache(self.engine.runtime, self.dir.name, 1 << 20)
+        cache = self._cache(1 << 20)
         cache.save([1], self._state([1]))
+        cache.flush()
         ident = next(Path(self.dir.name).glob("*.state")).stem
         (Path(self.dir.name) / f"{ident}.state").write_bytes(b"not a state")
         self.assertIsNone(cache.load([1]))
@@ -104,8 +118,9 @@ class FileCacheTest(unittest.TestCase):
 
     def test_a_saved_state_round_trips_and_the_file_is_compressed(self):
         state = self._state([7] * 400)
-        cache = FileCache(self.engine.runtime, self.dir.name, 1 << 20)
+        cache = self._cache(1 << 20)
         cache.save([7] * 400, state)
+        cache.flush()
         (blob,) = Path(self.dir.name).glob("*.state")
         self.assertLess(blob.stat().st_size,
                         len(self.engine.runtime.export_state(state)),
@@ -115,6 +130,48 @@ class FileCacheTest(unittest.TestCase):
         self.assertEqual(self.engine.runtime.export_state(back),
                          self.engine.runtime.export_state(state))
 
+    def test_an_owned_save_is_written_and_its_state_freed_once(self):
+        runtime = self.engine.runtime
+        freed = []
+        real_free = runtime.free_state
+        runtime.free_state = lambda state: (freed.append(state), real_free(state))
+        cache = self._cache(1 << 20)
+        clone = runtime.clone_state(self._state([1, 2, 3]))
+        cache.save([1, 2, 3], clone, owned=True)
+        cache.flush()
+        self.assertTrue(list(Path(self.dir.name).glob("*.state")))
+        self.assertEqual([id(s) for s in freed], [id(clone)])
+        second = runtime.clone_state(self._state([4, 5]))
+        cache.save([4, 5], second, owned=True)
+        cache.close()                      # and the same through close
+        self.assertEqual([id(s) for s in freed], [id(clone), id(second)])
+        self.assertEqual(len(list(Path(self.dir.name).glob("*.state"))), 2)
+
+    def test_a_save_dropped_by_the_queue_bound_still_frees_its_state(self):
+        runtime = self.engine.runtime
+        freed, logs = [], []
+        real_free, real_export = runtime.free_state, runtime.export_state
+        runtime.free_state = lambda state: (freed.append(state), real_free(state))
+        gate = threading.Event()
+
+        def blocked_export(state):
+            gate.wait()                    # the worker cannot finish one job
+            return real_export(state)
+
+        runtime.export_state = blocked_export
+        cache = self._cache(1 << 20, log=lambda level, message: logs.append((level, message)))
+        clones = [runtime.clone_state(self._state([i])) for i in range(10)]
+        for i, clone in enumerate(clones):
+            cache.save([i], clone, owned=True)
+        gate.set()
+        cache.close()
+        self.assertEqual(len(freed), 10, "every owned state freed exactly once")
+        self.assertEqual({id(s) for s in freed}, {id(c) for c in clones})
+        self.assertLess(len(list(Path(self.dir.name).glob("*.state"))), 10,
+                        "the save queue bound drops the oldest queued save")
+        self.assertTrue(any(level == "info" and "dropped" in message
+                            for level, message in logs), logs)
+
 
 class SentinelTest(unittest.TestCase):
     """What a hit was cut back to, learned and then preferred."""
@@ -122,28 +179,103 @@ class SentinelTest(unittest.TestCase):
     def test_a_cut_point_is_saved_and_beats_a_longer_partial_entry(self):
         with tempfile.TemporaryDirectory() as tmp:
             engine = Engine.open(MODEL, prefix_cache=(tmp, 1 << 20))
-            self.addCleanup(engine.close)
-            files = engine.cache.files
-            # an entry the next request only shares its first five tokens
-            # with: the hit is cut back to those five
-            files.save([1, 2, 3, 4, 5, 6, 7, 8, 9],
-                       _state_of(engine.runtime, [1, 2, 3, 4, 5, 6, 7, 8, 9]))
-            gen = engine.sequence([1, 2, 3, 4, 5, 9, 9], 4)
-            want = next(gen)
-            self.assertIsInstance(want, Admit)
-            while not isinstance(want, Want):
-                want = next(gen)     # a disk load's Waits, then the first Want
-            self.assertTrue(files.has([1, 2, 3, 4, 5]),
-                            "the cut point was not saved as a sentinel")
-            gen.close()
-            # a later request sharing seven tokens with the LONG entry and
-            # five with the sentinel: the clean sentinel wins (no truncate,
-            # no replay) over the longer partial match
-            got = files.match([1, 2, 3, 4, 5, 6, 7, 50], 0)
-            self.assertIsNotNone(got)
-            state, matched = got
-            self.assertEqual(matched, 5)
-            self.assertEqual(state.tokens, [1, 2, 3, 4, 5])
+            try:
+                files = engine.cache.files
+                # an entry the next request only shares its first five tokens
+                # with: the hit is cut back to those five
+                files.save([1, 2, 3, 4, 5, 6, 7, 8, 9],
+                           _state_of(engine.runtime, [1, 2, 3, 4, 5, 6, 7, 8, 9]))
+                files.flush()
+                gen = engine.sequence([1, 2, 3, 4, 5, 9, 9], 4)
+                want = next(gen)
+                self.assertIsInstance(want, Admit)
+                while not isinstance(want, Want):
+                    want = next(gen)  # a disk load's Waits, then the first Want
+                files.flush()         # the sentinel's save lands beside the model
+                self.assertTrue(files.has([1, 2, 3, 4, 5]),
+                                "the cut point was not saved as a sentinel")
+                gen.close()
+                # a later request sharing seven tokens with the LONG entry and
+                # five with the sentinel: the clean sentinel wins (no truncate,
+                # no replay) over the longer partial match
+                got = files.match([1, 2, 3, 4, 5, 6, 7, 50], 0)
+                self.assertIsNotNone(got)
+                state, matched = got
+                self.assertEqual(matched, 5)
+                self.assertEqual(state.tokens, [1, 2, 3, 4, 5])
+            finally:
+                engine.close()        # before the directory goes away
+
+
+class WaitTest(unittest.TestCase):
+    """A disk hit waits for its read without stopping the engine."""
+
+    SCRIPT_TEXT = "the mock model speaks"
+
+    @staticmethod
+    def _two_runs(tmp: str):
+        """A first engine leaves its prefix on disk; a second one only
+        finds it there (returns its head and tail token ids)."""
+        first = Engine.open(MODEL, prefix_cache=(tmp, 1 << 20))
+        head = first.runtime.encode("hello")
+        tail = first.runtime.encode("!!!")
+        first.generate_tokens(head, 64)
+        first.close()
+        return head, tail
+
+    def test_a_disk_hit_waits_before_the_first_want_and_still_answers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            head, tail = self._two_runs(tmp)
+            again = Engine.open(MODEL, prefix_cache=(tmp, 1 << 20))
+            gate, real_read = threading.Event(), Path.read_bytes
+
+            def slow_read(path):
+                data = real_read(path)
+                if path.suffix == ".state":
+                    gate.wait()          # the read takes its time
+                return data
+
+            try:
+                with mock.patch.object(Path, "read_bytes", slow_read):
+                    gen = again.sequence(head + tail, 64)
+                    self.assertIsInstance(next(gen), Admit)
+                    self.assertIsInstance(next(gen), Wait,
+                                          "the disk load must yield Wait")
+                    gate.set()
+                    want = next(gen)
+                    while not isinstance(want, Want):
+                        want = next(gen)  # more Waits, then the first Want
+                    result = None
+                    while True:          # step the items the sequence wants
+                        step = again.runtime.step([want.item], want.ctx)
+                        try:
+                            want = gen.send((step[0], 0.0))
+                        except StopIteration as stop:
+                            result = stop.value
+                            break
+            finally:
+                gate.set()
+                again.close()            # before the directory goes away
+            self.assertEqual(result.text, self.SCRIPT_TEXT)
+
+    def test_the_batcher_waits_for_a_slow_read_instead_of_spinning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            head, tail = self._two_runs(tmp)
+            again = Engine.open(MODEL, prefix_cache=(tmp, 1 << 20))
+            real_read = Path.read_bytes
+
+            def slow_read(path):
+                data = real_read(path)
+                if path.suffix == ".state":
+                    time.sleep(0.1)      # the ticket completes ~100 ms later
+                return data
+
+            try:
+                with mock.patch.object(Path, "read_bytes", slow_read):
+                    result = again.generate_tokens(head + tail, 64)
+            finally:
+                again.close()            # before the directory goes away
+            self.assertEqual(result.text, self.SCRIPT_TEXT)
 
 
 class AcrossRunsTest(unittest.TestCase):

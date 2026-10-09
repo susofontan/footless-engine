@@ -9,9 +9,10 @@ import json
 import os
 import random
 import sys
+import threading
 import time
 import zlib
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -44,6 +45,7 @@ DEFAULT_MAX_TOKENS = 16384
 # and its growth. Alone, a request is always admitted.
 ADMIT_HEADROOM = 8192
 COMPRESS = 1  # zlib level for saved-state blobs: cheap, and they compress well
+SAVE_QUEUE_MAX = 8  # queued saves kept; over that the oldest queued is dropped
 
 # The repetition guard: how long a repeating tail may run before it is a loop.
 # A model that collapses repeats one span of tokens verbatim until the budget
@@ -287,6 +289,50 @@ def _ident(key) -> str:
         json.dumps(_plain(key), separators=(",", ":")).encode()).hexdigest()
 
 
+class Ticket:
+    """Work outside the model in flight: `result()` waits for it.
+
+    `settle` maps what the worker produced to what the caller asked for and
+    runs at `result()` time on the CALLER's thread: a state is imported and
+    budget-claimed where the runtime already lives, while the worker only
+    moves and compresses bytes. A ticket made with `waiting=` shares that
+    ticket's readiness: it ends when the work behind it does. One caller
+    consumes a ticket (the engine thread), so settling runs once.
+    """
+
+    __slots__ = ("_event", "_raw", "_settle")
+
+    def __init__(self, settle=None, waiting: "Ticket | None" = None) -> None:
+        self._event = waiting._event if waiting is not None else threading.Event()
+        self._raw = None
+        self._settle = settle
+
+    def ready(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    def result(self):
+        self._event.wait()
+        if self._settle is not None:
+            settle, self._settle = self._settle, None
+            self._raw = settle(self._raw)
+        return self._raw
+
+    def finish(self, raw=None) -> None:
+        """Whoever does the work completes the ticket with its outcome."""
+        self._raw = raw
+        self._event.set()
+
+
+def _settled(value=None) -> Ticket:
+    """A ticket for work already done (or never begun)."""
+    ticket = Ticket()
+    ticket.finish(value)
+    return ticket
+
+
 class FileCache:
     """Saved states on disk: one directory, a byte cap of its own, LRU.
 
@@ -305,6 +351,12 @@ class FileCache:
     over `max_bytes` -- or while the filesystem has no room for the write. A
     cache never fails a request and never grows past its limit; a state that
     cannot fit even an empty cache is simply not saved.
+
+    Disk work runs on ONE worker thread of its own, reads before saves (a
+    request waits for a read; nobody waits for a save), so the engine thread
+    only ever runs the runtime's own calls. `save(..., owned=True)` hands
+    over a private clone for the worker to export and free on every path;
+    `load_async` / `begin_match` return a `Ticket` the request can wait on.
     """
 
     def __init__(self, runtime, path, max_bytes: int, log=None) -> None:
@@ -314,16 +366,25 @@ class FileCache:
         self._max_bytes = max(0, int(max_bytes))
         self._entries: "OrderedDict[tuple, tuple[str, int]]" = OrderedDict()
         self._total = 0
+        self._lock = threading.RLock()
+        self._cond = threading.Condition(self._lock)
+        self._reads: deque = deque()   # what a request waits for, taken first
+        self._saves: deque = deque()
+        self._pending: set[tuple] = set()  # keys queued but not yet written
+        self._saving = 0                   # saves queued or running
+        self._worker: threading.Thread | None = None
+        self._stopped = False
         self._load_index()
 
     # -- lookup -------------------------------------------------------------------------
 
     def has(self, key) -> bool:
-        return tuple(key) in self._entries
+        with self._lock:
+            return tuple(key) in self._entries
 
     def load(self, key) -> State | None:
         """The state saved under this whole key (an exact hit), or None."""
-        return self._import(tuple(key))
+        return self.load_async(key).result()
 
     def match(self, key, min_len: int = 0) -> tuple[State, int] | None:
         """The saved state sharing the best prefix with `key` -- more than
@@ -336,61 +397,235 @@ class FileCache:
         partial hit costs is unbounded and a hit that cannot cost one wins
         at any length. Within a class the longest match wins. (The RAM tier
         keeps longest-match: its truncates are snap-bounded.)"""
+        return self.begin_match(key, min_len).result()
+
+    def load_async(self, key) -> Ticket:
+        """Begin reading the state saved under this whole key (an exact
+        hit); the ticket's `result()` is the state or None."""
         key = tuple(key)
+        with self._lock:
+            entry = self._entries.get(key)
+        if entry is None:
+            return _settled()
+        return self._read(key, entry, None, lambda state: state)
+
+    def begin_match(self, key, min_len: int = 0) -> Ticket:
+        """`match` begun: the file read runs beside the model and the
+        ticket's `result()` is (state, matched) or None."""
+        key = tuple(key)
+        with self._lock:
+            picked = self._pick(key, min_len)
+        if picked is None:
+            return _settled()
+        entry_key, entry, matched, clean = picked
+        return self._read(entry_key, entry, None if clean else matched,
+                          lambda state: (state, matched))
+
+    def _pick(self, key: tuple, min_len: int):
+        """(entry key, entry, matched, clean) for `match`'s ranking (its
+        docstring is the rule), or None. Called under the lock."""
         best, best_len, best_clean = None, 0, False
-        for entry in self._entries:
+        for entry_key in self._entries:
             common = 0
-            for a, b in zip(entry, key):
+            for a, b in zip(entry_key, key):
                 if a != b:
                     break
                 common += 1
             if common <= min_len:
                 continue
-            clean = len(entry) == common
+            clean = len(entry_key) == common
             if best is None or (clean, common) > (best_clean, best_len):
-                best, best_len, best_clean = entry, common, clean
-        state = self._import(best) if best is not None else None
-        if state is None:
+                best, best_len, best_clean = entry_key, common, clean
+        if best is None:
             return None
-        if not best_clean:
-            self._runtime.truncate_state(state, best_len)
-        return state, best_len
+        return best, self._entries[best], best_len, best_clean
+
+    def _read(self, key: tuple, entry, cut, wrap) -> Ticket:
+        """The read begun: the worker reads and decompresses, and the
+        ticket's `result()` imports the state on this thread and truncates
+        it to `cut` (None: no truncate -- a clean hit needs none)."""
+        ident = entry[0]
+
+        def settle(raw):
+            kind, payload = raw
+            if kind == "gone":
+                return None
+            if kind != "ok":
+                self._log("warning", f"saved state unreadable, dropped: {payload}")
+                self._drop_if(key, ident)
+                return None
+            try:
+                state = self._runtime.import_state(payload)
+            except BudgetRefused:
+                self._log("info", "a saved state did not fit the budget: not used")
+                return None
+            except Exception as exc:  # noqa: BLE001 - an unreadable entry is a miss
+                self._log("warning", f"saved state unreadable, dropped: {exc}")
+                self._drop_if(key, ident)
+                return None
+            if cut is not None:
+                self._runtime.truncate_state(state, cut)
+            self._touch(key)
+            return wrap(state)
+
+        ticket = Ticket(settle)
+        with self._cond:
+            if self._stopped:
+                ticket.finish(("gone", None))
+                return ticket
+            self._reads.append((key, ident, ticket))
+            self._cond.notify_all()
+        self._ensure_worker()
+        return ticket
 
     # -- save --------------------------------------------------------------------------
 
-    def save(self, key, state: State, owned: bool = False) -> None:
-        """Keep `state` under `key`. A key already saved holds that same
-        state by construction: its entry is only refreshed as used. With
-        `owned` the state is this cache's private copy (`clone_state`d for
-        it alone) and the cache frees it on every path -- saved or dropped;
-        without it the state is the caller's and only its exported bytes
-        move here."""
+    def save(self, key, state: State, owned: bool = False) -> Ticket:
+        """Keep `state` under `key`, the write run beside the model (the
+        ticket completes when the entry lands or is dropped). A key already
+        saved holds that same state by construction: its entry is only
+        refreshed as used. With `owned` the state is this cache's private
+        copy (`clone_state`d for it alone) -- the worker exports and frees
+        it on every path: written, dropped, refused. Without it the state is
+        the caller's and may be reused imminently, so it is exported HERE
+        and now and only its bytes move."""
         key = tuple(key)
-        try:
+        ticket = Ticket()
+        with self._lock:
+            known = key in self._entries or key in self._pending
             if key in self._entries:
                 self._touch(key)
-                return
+        if known:
+            if owned:
+                self._runtime.free_state(state)
+            ticket.finish(None)
+            return ticket
+        blob = None
+        if not owned:
             try:
                 blob = self._runtime.export_state(state)
             except Exception as exc:  # noqa: BLE001 - a cache never fails a request
                 self._log("warning", f"state not saved: {exc}")
-                return
-            blob = zlib.compress(blob, COMPRESS)
-            size = len(blob)
+                ticket.finish(None)
+                return ticket
+        job = (key, blob, state, owned, ticket)
+        dropped = []
+        with self._cond:
+            closed = self._stopped
+            if not closed:
+                self._pending.add(key)
+                self._saves.append(job)
+                self._saving += 1
+                while len(self._saves) > SAVE_QUEUE_MAX:
+                    drop = self._saves.popleft()
+                    dropped.append(drop)
+                    self._pending.discard(drop[0])
+                    self._saving -= 1
+                self._cond.notify_all()
+        if closed:
+            if owned:
+                self._runtime.free_state(state)
+            ticket.finish(None)
+            return ticket
+        for _, _, drop_state, drop_owned, drop_ticket in dropped:
+            self._log("info", f"save queue full ({SAVE_QUEUE_MAX} waiting): "
+                              f"the oldest queued state was dropped")
+            if drop_owned:
+                self._runtime.free_state(drop_state)
+            drop_ticket.finish(None)
+        self._ensure_worker()
+        return ticket
+
+    def flush(self) -> None:
+        """Wait for every queued save to land (or be dropped)."""
+        with self._cond:
+            while self._saving:
+                self._cond.wait()
+
+    def close(self) -> None:
+        """Flush, then stop the worker after its last job."""
+        self.flush()
+        with self._cond:
+            self._stopped = True
+            self._cond.notify_all()
+            worker = self._worker
+        if worker is not None:
+            worker.join()
+
+    # -- the worker ----------------------------------------------------------------------
+
+    def _ensure_worker(self) -> None:
+        with self._lock:
+            if self._worker is None and not self._stopped:
+                self._worker = threading.Thread(
+                    target=self._work, name="footless-file-cache", daemon=True)
+                self._worker.start()
+
+    def _work(self) -> None:
+        """The one thread that touches the disk: reads first (a request
+        waits for one), then saves, until `close` leaves nothing."""
+        while True:
+            with self._cond:
+                job, read = None, False
+                while job is None:
+                    if self._reads:
+                        job, read = self._reads.popleft(), True
+                    elif self._saves:
+                        job = self._saves.popleft()
+                    elif self._stopped:
+                        return
+                    else:
+                        self._cond.wait()
+            try:
+                if read:
+                    self._run_read(*job)
+                else:
+                    self._run_save(*job)
+            finally:
+                with self._cond:
+                    if not read:
+                        self._saving -= 1
+                        self._pending.discard(job[0])
+                    self._cond.notify_all()
+
+    def _run_read(self, key: tuple, ident: str, ticket: Ticket) -> None:
+        try:
+            raw = ("ok", zlib.decompress(
+                (self._path / f"{ident}.state").read_bytes()))
+        except Exception as exc:  # noqa: BLE001 - unreadable: the settle drops it
+            raw = ("bad", exc)
+        ticket.finish(raw)
+
+    def _run_save(self, key: tuple, blob, state, owned: bool,
+                  ticket: Ticket) -> None:
+        """One queued save: export (an owned state), compress, make room,
+        write. An owned state is freed whatever happens."""
+        try:
+            if owned:
+                try:
+                    blob = self._runtime.export_state(state)
+                except Exception as exc:  # noqa: BLE001 - a cache never fails a request
+                    self._log("warning", f"state not saved: {exc}")
+                    return
+            data = zlib.compress(blob, COMPRESS)
+            size = len(data)
             if size > self._max_bytes:
                 self._log("info", f"a state of {size} B does not fit the cache's "
                                   f"{self._max_bytes} B: not saved")
                 return
-            while self._total + size > self._max_bytes:
-                if not self._evict_lru():
-                    break
             ident = _ident(key)
-            if self._write(ident, key, blob):
-                self._entries[key] = (ident, size)
-                self._total += size
+            with self._lock:
+                while self._total + size > self._max_bytes:
+                    if not self._evict_lru():
+                        break
+            if self._write(ident, key, data):
+                with self._lock:
+                    self._entries[key] = (ident, size)
+                    self._total += size
         finally:
             if owned:
                 self._runtime.free_state(state)
+            ticket.finish(None)
 
     def _write(self, ident: str, key, blob: bytes) -> bool:
         """The key and then the blob, the blob renamed into place. A full
@@ -412,25 +647,15 @@ class FileCache:
                     self._log("warning", f"state not saved: {exc}")
                     return False
 
-    def _import(self, key: tuple) -> State | None:
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        ident, _ = entry
-        try:
-            blob = zlib.decompress((self._path / f"{ident}.state").read_bytes())
-            state = self._runtime.import_state(blob)
-        except BudgetRefused:
-            self._log("info", "a saved state did not fit the budget: not used")
-            return None
-        except Exception as exc:  # noqa: BLE001 - an unreadable entry is a miss
-            self._log("warning", f"saved state unreadable, dropped: {exc}")
-            self._drop(key)
-            return None
-        self._touch(key)
-        return state
-
     # -- the index ---------------------------------------------------------------------
+
+    def _drop_if(self, key: tuple, ident: str) -> None:
+        """Drop `key`'s entry only if it is still the one that failed: a
+        newer save of the same key must not go with an old read's error."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None and entry[0] == ident:
+                self._drop(key)
 
     def _load_index(self) -> None:
         """The directory as a previous run left it, oldest first (LRU order
@@ -452,23 +677,28 @@ class FileCache:
             pass
 
     def _touch(self, key: tuple) -> None:
-        self._entries.move_to_end(key)
+        with self._lock:
+            self._entries.move_to_end(key)
+            ident = self._entries[key][0]
         try:
-            os.utime(self._path / f"{self._entries[key][0]}.state")
+            os.utime(self._path / f"{ident}.state")
         except OSError:
             pass
 
     def _drop(self, key: tuple) -> None:
-        entry = self._entries.pop(key, None)
+        with self._lock:
+            entry = self._entries.pop(key, None)
+            if entry is not None:
+                self._total -= entry[1]
         if entry is not None:
-            self._total -= entry[1]
             self._unlink(entry[0])
 
     def _evict_lru(self) -> bool:
-        if not self._entries:
-            return False
-        _, (ident, size) = self._entries.popitem(last=False)
-        self._total -= size
+        with self._lock:
+            if not self._entries:
+                return False
+            _, (ident, size) = self._entries.popitem(last=False)
+            self._total -= size
         self._unlink(ident)
         return True
 
@@ -498,6 +728,13 @@ class PrefixCache:
         self.files = files
 
     def lookup(self, tokens: list[int]) -> tuple[State, int]:
+        """`begin_lookup` run to its result (synchronous callers)."""
+        return self.begin_lookup(tokens).result()
+
+    def begin_lookup(self, tokens: list[int]) -> Ticket:
+        """This cache's answer for `tokens` begun -- (state, matched). The
+        disk tier's read runs beside the model; the RAM side is taken when
+        the ticket's `result()` is called."""
         key = tuple(tokens)
         best: tuple[int, ...] | None = None
         best_len = 0
@@ -513,34 +750,44 @@ class PrefixCache:
             # `StepResult.forwarded_tokens` instead of what the request fed.
             if common > best_len:
                 best, best_len = entry, common
-        # a saved state may match longer than anything in memory -- the
-        # machine restarted, or the budget evicted the entry
+
+        def settle(files_hit):
+            # a saved state may match longer than anything in memory -- the
+            # machine restarted, or the budget evicted the entry
+            if files_hit is not None:
+                return files_hit
+            if best is None:
+                return self._runtime.new_state(), 0
+            # out of the cache while it is copied: making room for the copy may
+            # evict entries, and never this one. It may even be gone by now
+            # (another request's step evicted it while the disk was read).
+            entry = self._entries.pop(best, None)
+            if entry is None:
+                return self._runtime.new_state(), 0
+            fits = self.available is None or \
+                self._runtime.state_nbytes(entry) <= self.available()
+            state = None
+            if fits:
+                try:
+                    state = self._runtime.clone_state(entry)
+                except BudgetRefused:
+                    state = None
+            if state is None:
+                # no room for a copy (a long conversation's state is most of
+                # the card): the request takes the entry itself and continues it --
+                # a fresh state would re-forward the whole prefix
+                self._runtime.truncate_state(entry, best_len)
+                return entry, best_len
+            self._entries[best] = entry
+            self._runtime.truncate_state(state, best_len)
+            return state, best_len
+
         if self.files is not None and best_len < len(key):
-            got = self.files.match(key, best_len)
-            if got is not None:
-                return got
-        if best is None:
-            return self._runtime.new_state(), 0
-        # out of the cache while it is copied: making room for the copy may
-        # evict entries, and never this one
-        entry = self._entries.pop(best)
-        fits = self.available is None or \
-            self._runtime.state_nbytes(entry) <= self.available()
-        state = None
-        if fits:
-            try:
-                state = self._runtime.clone_state(entry)
-            except BudgetRefused:
-                state = None
-        if state is None:
-            # no room for a copy (a long conversation's state is most of the
-            # card): the request takes the entry itself and continues it --
-            # a fresh state would re-forward the whole prefix
-            self._runtime.truncate_state(entry, best_len)
-            return entry, best_len
-        self._entries[best] = entry
-        self._runtime.truncate_state(state, best_len)
-        return state, best_len
+            inner = self.files.begin_match(key, best_len)
+            return Ticket(lambda _raw: settle(inner.result()), waiting=inner)
+        ticket = Ticket(lambda _raw: settle(None))
+        ticket.finish(None)
+        return ticket
 
     def nbytes(self) -> int:
         """What the entries hold: room an eviction can give back."""
@@ -977,7 +1224,8 @@ class Engine:
     ):
         """`generate_tokens` as a generator a `Batcher` drives beside others.
 
-        It yields what it needs -- `Admit` first (room for a state), then one
+        It yields what it needs -- `Admit` first (room for a state), any
+        `Wait` (a saved state loading) before its first `Want`, then one
         `Want` a step -- and is sent each step's `(StepResult, seconds)`; it
         returns the `GenerationResult`. A `Preempted` thrown in at a step
         boundary parks it: its state goes to the prefix cache, keyed on what
@@ -1058,11 +1306,17 @@ class Engine:
             state, matched = None, 0
             if not generated and self.prompt_cache is not None:
                 # a whole prompt seen before: past its prefill already
-                state = self.prompt_cache.load(keyed)
+                ticket = self.prompt_cache.load_async(keyed)
+                while not ticket.ready():
+                    yield Wait(ticket)
+                state = ticket.result()
                 if state is not None:
                     matched = len(keyed)
             if state is None:
-                state, matched = self.cache.lookup(context)
+                ticket = self.cache.begin_lookup(context)
+                while not ticket.ready():
+                    yield Wait(ticket)
+                state, matched = ticket.result()
             if self.cache.files is not None and 0 < matched < len(context) \
                     and not self.cache.files.has(tuple(context[:matched])):
                 # what this hit was cut back to: the next turn usually
@@ -1123,8 +1377,7 @@ class Engine:
                     try:
                         kept = self.runtime.clone_state(state)
                         self.runtime.truncate_state(kept, len(keyed))
-                        self.prompt_cache.save(keyed, kept)
-                        self.runtime.free_state(kept)
+                        self.prompt_cache.save(keyed, kept, owned=True)
                     except BudgetRefused:
                         pass
 
@@ -1179,6 +1432,10 @@ class Engine:
                                 looped=cut is not None, absorbed_tokens=generated)
 
     def close(self) -> None:
+        if self.prompt_cache is not None:
+            self.prompt_cache.close()
+        if self.cache.files is not None:
+            self.cache.files.close()
         self.cache.free_all()
         self.runtime.close()
 
@@ -1196,6 +1453,13 @@ class Admit:
     """A sequence asks to be admitted: room for `nbytes` of state."""
 
     nbytes: int
+
+
+@dataclass
+class Wait:
+    """A sequence waits for work outside the model (a saved state loading)."""
+
+    ticket: object
 
 
 @dataclass
@@ -1234,10 +1498,14 @@ class Batcher:
     others -- while the budget has room for what they ask (`Admit`: the ledger's
     free bytes and what the prefix cache could give back). Each `step` runs ONE
     runtime step over the admitted tasks: every decode, and at most one prefill
-    chunk (the oldest request's). A task cancelled at a step boundary is ended
-    there without the model. A step the budget refuses runs again without its
-    youngest task, which is preempted and admitted again later; alone, a
-    refusal is the task's error, as it always was.
+    chunk (the oldest request's). A task waiting on work outside the model
+    (`Wait`: a saved state loading) is admitted but out of the ready and
+    stepping sets until its wait is over; a step with nothing else to do
+    blocks briefly on one waiting ticket instead of spinning. A task cancelled
+    at a step boundary is ended there without the model. A step the budget
+    refuses runs again without its youngest task, which is preempted and
+    admitted again later; alone, a refusal is the task's error, as it always
+    was.
     """
 
     def __init__(self, engine: "Engine") -> None:
@@ -1300,7 +1568,14 @@ class Batcher:
             engine._sharing = len(live) > 1
             self._advance(task)
         engine._sharing = len(live) > 1
-        ready = [t for t in live if not t.done and isinstance(t.want, Want)]
+        for task in live:
+            # a wait that is over: resume the sequence here, so its want is
+            # settled before the ready set is taken (a still-waiting task
+            # keeps its `Wait` and steps nothing this round)
+            if not task.done and isinstance(task.want, Wait) \
+                    and task.want.ticket.ready():
+                self._advance(task)
+        ready = [t for t in live if not t.done and isinstance(task.want, Want)]
         stepping = []
         for task in ready:
             if task.want.ctx.cancelled():
@@ -1311,6 +1586,14 @@ class Batcher:
         decodes = [t for t in stepping if not t.want.item.input_tokens]
         prefills = [t for t in stepping if t.want.item.input_tokens]
         batch = decodes + prefills[:1]
+        if not batch:
+            for task in live:
+                if isinstance(task.want, Wait):
+                    # nothing to step and work in flight: block briefly on
+                    # one ticket rather than spin -- a request arriving
+                    # during the wait is never held longer than this
+                    task.want.ticket.wait(0.05)
+                    break
         while batch:
             try:
                 started = time.perf_counter()

@@ -60,7 +60,11 @@ flags, neither exists and nothing is written.
 A hit shorter than its entry's key is fitted by the package's
 `truncate_state`: where a state cannot be cut back cheaply, the kept tail
 re-forwards in the next step (reported as `forwarded_tokens`, CONTRACT.md).
-A whole-prompt hit starts past its prefill outright.
+A whole-prompt hit starts past its prefill outright. The engine also saves
+what a hit was cut back to: sentinel entries at the cut points it sees, so
+a later turn starts at one instead of re-forwarding the kept tail. Entries
+are zlib-compressed, and saves and loads run beside the model — a request
+waits only for the state it is about to use.
 
 ## Fields
 

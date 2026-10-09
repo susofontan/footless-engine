@@ -37,9 +37,10 @@ never an `if` on the model.
 | `footless/decisions.py` | decision questions: rendering, labels, probabilities |
 | `footless/cli.py`, `bench.py` | the command line and the speed benchmark |
 
-A request is `Engine.sequence`, a generator that yields `Admit` and then one
-`Want` (a `StepItem`) per step; `Batcher` admits sequences and runs one
-`runtime.step` over all of them. `generate_tokens` is one sequence run alone.
+A request is `Engine.sequence`, a generator that yields `Admit`, any `Wait`
+(a saved state loading) and then one `Want` (a `StepItem`) per step; `Batcher`
+admits sequences and runs one `runtime.step` over all of them. `generate_tokens`
+is one sequence run alone.
 
 ## Process
 
@@ -125,7 +126,9 @@ gates, and correctness gates come before speed. Then:
   its own directory and byte cap and LRU at the cap or a full disk:
   `serve --prompt-cache` (a whole prompt's state, skipping its prefill) and
   `--prefix-cache` (absorbed prefixes, beside the RAM cache), both via
-  `export_state` / `import_state` (2026-10-09).
+  `export_state` / `import_state` — entries zlib-compressed, a sentinel at
+  every cut point a hit was truncated to, saves and loads beside the model
+  (2026-10-09).
 
 - Images cross the contract behind the `vision` capability, on only when the
   operator asks (`serve --vision`): `set_vision`, `chat_images` (prompt ids and
