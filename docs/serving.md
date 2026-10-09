@@ -34,6 +34,34 @@ request at the next step boundary.
 A package with `max_batch = 1` is served one request at a time, by the same
 code.
 
+## Saved states on disk
+
+Two optional caches keep states in a directory of their own, each under a
+byte cap of its own, so reuse survives a restart and a budget eviction:
+
+| Flags | What it keeps |
+| --- | --- |
+| `--prompt-cache DIR --prompt-cache-max SIZE` | each prompt's state as it stood before its first token: the whole prompt again skips its prefill |
+| `--prefix-cache DIR --prefix-cache-max SIZE` | every absorbed prefix's state: a shared head is reused across runs, beside the RAM prefix cache |
+
+`SIZE` is bytes, or with a K/M/G/T suffix (`2G`). A cache is on only when
+both its flags are given. Entries are states as the package exports them
+(`export_state`, CONTRACT.md: opaque, countable), keyed on the token ids —
+an image's placeholders are its digest — and held least-recently-used first.
+Over its cap a cache drops its oldest entries; a write that meets a full
+filesystem evicts the same way until it fits, and is dropped with the reason
+logged when even an empty cache cannot hold it. A cache never fails a
+request.
+
+The prompt cache answers whole prompts only; the prefix cache any common
+prefix, and a match saved on disk longer than memory's wins. Without the
+flags, neither exists and nothing is written.
+
+A hit shorter than its entry's key is fitted by the package's
+`truncate_state`: where a state cannot be cut back cheaply, the kept tail
+re-forwards in the next step (reported as `forwarded_tokens`, CONTRACT.md).
+A whole-prompt hit starts past its prefill outright.
+
 ## Fields
 
 A field the engine can execute is honoured: prompt and messages, `n`, the

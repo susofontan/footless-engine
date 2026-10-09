@@ -76,7 +76,10 @@ span verbatim past all use (`--loop-guard exact`, the default; `--loop-guard`
 alone also ends near-copies; `--no-loop-guard` lets it run). `chat` takes
 `--no-thinking` and `--reasoning LEVEL`; `generate`, `chat` and `serve` take
 `--speculative` (alias `--mtp`) for packages that declare it; `serve` takes
-`--vision` (image input) for packages that declare `vision`.
+`--vision` (image input) for packages that declare `vision`, and keeps states
+on disk behind `--prompt-cache DIR --prompt-cache-max SIZE` and
+`--prefix-cache DIR --prefix-cache-max SIZE` — each cache its own directory
+and cap, LRU at the cap or at a full disk ([docs/serving.md](docs/serving.md)).
 
 ## The rules
 

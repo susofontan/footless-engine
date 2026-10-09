@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import importlib.util
+import json
+import os
 import random
 import sys
 import time
@@ -266,15 +270,208 @@ class EngineServices:
         print(f"[{level}] {message}", file=sys.stderr)
 
 
-class PrefixCache:
-    """Prefix reuse: which cached state to keep, key it, evict it."""
+def _plain(key) -> list:
+    """A key as json: tuples (an image's `(digest, index)` placeholders) as lists."""
+    return [_plain(x) for x in key] if isinstance(key, tuple) else key
 
-    def __init__(self, runtime: Runtime, available=None) -> None:
+
+def _canon(raw) -> tuple:
+    """A key as read back: lists as tuples, so it hashes."""
+    return tuple(_canon(x) for x in raw) if isinstance(raw, list) else raw
+
+
+def _ident(key) -> str:
+    return hashlib.sha256(
+        json.dumps(_plain(key), separators=(",", ":")).encode()).hexdigest()
+
+
+class FileCache:
+    """Saved states on disk: one directory, a byte cap of its own, LRU.
+
+    The engine's second tier under `PrefixCache`, and the one that survives
+    restarts (CONTRACT.md: `export_state` / `import_state` move state between
+    tiers and across runs). A request's whole prompt keys the PROMPT cache --
+    an exact hit starts past its prefill -- and any absorbed prefix keys the
+    PREFIX cache. Blobs are opaque states; keys are token ids (an image's
+    placeholders are its digest, as in `PrefixCache`).
+
+    Each entry is `<sha256>.key` (its tokens) beside `<sha256>.state` (the
+    blob, written last and renamed into place, so a crash never leaves half
+    an entry). Order in `self._entries` is least-recently-used first: a hit
+    moves its entry to the end, and `save` drops the front while the cache is
+    over `max_bytes` -- or while the filesystem has no room for the write. A
+    cache never fails a request and never grows past its limit; a state that
+    cannot fit even an empty cache is simply not saved.
+    """
+
+    def __init__(self, runtime, path, max_bytes: int, log=None) -> None:
+        self._runtime = runtime
+        self._log = log or (lambda level, message: None)
+        self._path = Path(path)
+        self._max_bytes = max(0, int(max_bytes))
+        self._entries: "OrderedDict[tuple, tuple[str, int]]" = OrderedDict()
+        self._total = 0
+        self._load_index()
+
+    # -- lookup -------------------------------------------------------------------------
+
+    def has(self, key) -> bool:
+        return tuple(key) in self._entries
+
+    def load(self, key) -> State | None:
+        """The state saved under this whole key (an exact hit), or None."""
+        return self._import(tuple(key))
+
+    def match(self, key, min_len: int = 0) -> tuple[State, int] | None:
+        """The saved state sharing the longest prefix with `key` -- more than
+        `min_len` tokens of it -- truncated to it, as (state, matched)."""
+        key = tuple(key)
+        best, best_len = None, min_len
+        for entry in self._entries:
+            common = 0
+            for a, b in zip(entry, key):
+                if a != b:
+                    break
+                common += 1
+            if common > best_len:
+                best, best_len = entry, common
+        state = self._import(best) if best is not None else None
+        if state is None:
+            return None
+        self._runtime.truncate_state(state, best_len)
+        return state, best_len
+
+    # -- save --------------------------------------------------------------------------
+
+    def save(self, key, state: State) -> None:
+        """Keep `state` under `key`. A key already saved holds that same
+        state by construction: its entry is only refreshed as used."""
+        key = tuple(key)
+        if key in self._entries:
+            self._touch(key)
+            return
+        try:
+            blob = self._runtime.export_state(state)
+        except Exception as exc:  # noqa: BLE001 - a cache never fails a request
+            self._log("warning", f"state not saved: {exc}")
+            return
+        size = len(blob)
+        if size > self._max_bytes:
+            self._log("info", f"a state of {size} B does not fit the cache's "
+                              f"{self._max_bytes} B: not saved")
+            return
+        while self._total + size > self._max_bytes:
+            if not self._evict_lru():
+                break
+        ident = _ident(key)
+        if self._write(ident, key, blob):
+            self._entries[key] = (ident, size)
+            self._total += size
+
+    def _write(self, ident: str, key, blob: bytes) -> bool:
+        """The key and then the blob, the blob renamed into place. A full
+        disk evicts LRU until the write fits; when even an empty cache cannot
+        hold it, the state is dropped with the reason logged."""
+        kpath = self._path / f"{ident}.key"
+        spath = self._path / f"{ident}.state"
+        tmp = self._path / f"{ident}.state.tmp"
+        while True:
+            try:
+                kpath.write_text(json.dumps(_plain(key)))
+                tmp.write_bytes(blob)
+                os.replace(tmp, spath)
+                return True
+            except OSError as exc:
+                tmp.unlink(missing_ok=True)
+                if exc.errno != errno.ENOSPC or not self._evict_lru():
+                    kpath.unlink(missing_ok=True)
+                    self._log("warning", f"state not saved: {exc}")
+                    return False
+
+    def _import(self, key: tuple) -> State | None:
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        ident, _ = entry
+        try:
+            blob = (self._path / f"{ident}.state").read_bytes()
+            state = self._runtime.import_state(blob)
+        except BudgetRefused:
+            self._log("info", "a saved state did not fit the budget: not used")
+            return None
+        except Exception as exc:  # noqa: BLE001 - an unreadable entry is a miss
+            self._log("warning", f"saved state unreadable, dropped: {exc}")
+            self._drop(key)
+            return None
+        self._touch(key)
+        return state
+
+    # -- the index ---------------------------------------------------------------------
+
+    def _load_index(self) -> None:
+        """The directory as a previous run left it, oldest first (LRU order
+        is the files' age; every hit touches its file)."""
+        self._path.mkdir(parents=True, exist_ok=True)
+        found = []
+        for kpath in self._path.glob("*.key"):
+            spath = kpath.with_suffix(".state")
+            try:
+                found.append((kpath.stat().st_mtime, kpath.stem,
+                              _canon(json.loads(kpath.read_text())),
+                              spath.stat().st_size))
+            except (OSError, ValueError):
+                continue
+        for _, ident, key, size in sorted(found):
+            self._entries[key] = (ident, size)
+            self._total += size
+        while self._total > self._max_bytes and self._evict_lru():
+            pass
+
+    def _touch(self, key: tuple) -> None:
+        self._entries.move_to_end(key)
+        try:
+            os.utime(self._path / f"{self._entries[key][0]}.state")
+        except OSError:
+            pass
+
+    def _drop(self, key: tuple) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._total -= entry[1]
+            self._unlink(entry[0])
+
+    def _evict_lru(self) -> bool:
+        if not self._entries:
+            return False
+        _, (ident, size) = self._entries.popitem(last=False)
+        self._total -= size
+        self._unlink(ident)
+        return True
+
+    def _unlink(self, ident: str) -> None:
+        for p in (self._path / f"{ident}.key", self._path / f"{ident}.state"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+class PrefixCache:
+    """Prefix reuse: which cached state to keep, key it, evict it.
+
+    `files` (a `FileCache`) is the second tier: states saved on disk, which
+    survive a restart and a budget eviction. Memory wins a tie, a longer
+    match from the files wins outright.
+    """
+
+    def __init__(self, runtime: Runtime, available=None,
+                 files: "FileCache | None" = None) -> None:
         self._runtime = runtime
         self._entries: "OrderedDict[tuple[int, ...], State]" = OrderedDict()
         # the ledger's free bytes (set by Engine.open): a copy that would not
         # fit beside the entry hands the entry itself over instead
         self.available = available
+        self.files = files
 
     def lookup(self, tokens: list[int]) -> tuple[State, int]:
         key = tuple(tokens)
@@ -292,6 +489,12 @@ class PrefixCache:
             # `StepResult.forwarded_tokens` instead of what the request fed.
             if common > best_len:
                 best, best_len = entry, common
+        # a saved state may match longer than anything in memory -- the
+        # machine restarted, or the budget evicted the entry
+        if self.files is not None and best_len < len(key):
+            got = self.files.match(key, best_len)
+            if got is not None:
+                return got
         if best is None:
             return self._runtime.new_state(), 0
         # out of the cache while it is copied: making room for the copy may
@@ -325,6 +528,8 @@ class PrefixCache:
         if old is not None:
             self._runtime.free_state(old)
         self._entries[key] = state
+        if self.files is not None:
+            self.files.save(key, state)
 
     def evict_lru(self) -> bool:
         if not self._entries:
@@ -442,6 +647,9 @@ class Engine:
         # request admitted (a prefill then shares its steps; `sequence`)
         self._sharing = False
         self.vision_on = False   # images read: asked for by the operator (Engine.vision)
+        # the saved-prompt tier (a `FileCache`), when the operator asked for
+        # one: a whole prompt seen before starts past its prefill
+        self.prompt_cache: FileCache | None = None
 
     @classmethod
     def open(
@@ -449,6 +657,8 @@ class Engine:
         model_dir: str | Path,
         backend: str | None = None,
         budget: int = DEFAULT_BUDGET,
+        prompt_cache: tuple[str, int] | None = None,
+        prefix_cache: tuple[str, int] | None = None,
     ) -> "Engine":
         model_dir = Path(model_dir)
         footless_dir = model_dir / "footless"
@@ -468,7 +678,12 @@ class Engine:
         cache.available = services.accounting.available
         facts = runtime.open(str(model_dir), services)
         verify(model, facts)
-        return cls(model, runtime, facts, services, cache)
+        if prefix_cache is not None:
+            cache.files = FileCache(runtime, *prefix_cache, log=services.log)
+        engine = cls(model, runtime, facts, services, cache)
+        if prompt_cache is not None:
+            engine.prompt_cache = FileCache(runtime, *prompt_cache, log=services.log)
+        return engine
 
     def generate(
         self, prompt: str, max_tokens: int = DEFAULT_MAX_TOKENS, on_token=None,
@@ -816,7 +1031,14 @@ class Engine:
             # (after a preemption) the output so far
             context = keyed + generated
             yield Admit(self.facts.cache_bytes_per_token * (len(context) + ADMIT_HEADROOM))
-            state, matched = self.cache.lookup(context)
+            state, matched = None, 0
+            if not generated and self.prompt_cache is not None:
+                # a whole prompt seen before: past its prefill already
+                state = self.prompt_cache.load(keyed)
+                if state is not None:
+                    matched = len(keyed)
+            if state is None:
+                state, matched = self.cache.lookup(context)
             fed = (list(tokens) + generated)[matched:]
             taken = len(generated)          # output this admission adds is past here
             at = 0                          # of `fed`, forwarded so far
@@ -851,6 +1073,22 @@ class Engine:
                         consumed = at
                     if finished or (max_tokens > 0 and len(generated) >= max_tokens):
                         break
+
+                if first and keyed and at == len(fed) \
+                        and self.prompt_cache is not None and not self.prompt_cache.has(keyed):
+                    # the prompt as it stood before its first token: what a
+                    # repeat of this whole prompt starts from. The state has
+                    # already sampled that token (the last prefill chunk
+                    # does), so the saved one is a clone cut back to the
+                    # prompt; no room for the copy, and the prompt is simply
+                    # not saved
+                    try:
+                        kept = self.runtime.clone_state(state)
+                        self.runtime.truncate_state(kept, len(keyed))
+                        self.prompt_cache.save(keyed, kept)
+                        self.runtime.free_state(kept)
+                    except BudgetRefused:
+                        pass
 
                 decoded = 0
                 while not finished and len(generated) < max_tokens:

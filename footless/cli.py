@@ -66,6 +66,32 @@ def _add_sampling(parser) -> None:
                         const="off", help="same as --loop-guard off")
 
 
+def _size(text: str) -> int:
+    """A byte count: plain bytes, or with a K/M/G/T suffix (1024s)."""
+    units = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+    tail = text.strip().upper()
+    unit = tail[-1] if tail and not tail[-1].isdigit() else ""
+    number = tail[:-1] if unit else tail
+    if (unit and unit not in units) or not number or not number.isdigit():
+        raise ContractError(f"{text!r} is not a byte count (try 512M, 2G, or bytes)")
+    return int(number) * units.get(unit, 1)
+
+
+def _caching(args, name: str) -> tuple[str, int] | None:
+    """`--<name> DIR` and its `--<name>-max SIZE`: a saved-state cache of its
+    own, on only when the operator gives both. LRU past its cap, and past
+    what the directory's filesystem has left (engine.FileCache)."""
+    field = name.replace("-", "_")
+    path = getattr(args, field, None)
+    cap = getattr(args, field + "_max", None)
+    if path is None and cap is None:
+        return None
+    if path is None or cap is None:
+        raise ContractError(f"--{name} and --{name}-max go together "
+                            "(a directory and a byte cap)")
+    return path, _size(cap)
+
+
 def _sampling(args, defaults: SamplingSpec | None) -> SamplingSpec | None:
     """The spec the flags pin, over the package's own defaults.
 
@@ -133,12 +159,26 @@ def main(argv: list[str] | None = None) -> int:
                        help="require Authorization: Bearer <key> on /v1 routes")
     serve.add_argument("--served-model-name", default=None,
                        help="model name the API answers to (default: the manifest's)")
+    serve.add_argument("--prompt-cache", default=None, metavar="DIR",
+                       help="keep each prompt's post-prefill state in DIR: "
+                            "the whole prompt again skips its prefill, "
+                            "across runs")
+    serve.add_argument("--prompt-cache-max", default=None, metavar="SIZE",
+                       help="its byte cap (512M, 2G, or bytes), LRU past it")
+    serve.add_argument("--prefix-cache", default=None, metavar="DIR",
+                       help="keep every absorbed prefix's state in DIR: "
+                            "shared prefixes reuse past a restart, beside "
+                            "the RAM prefix cache")
+    serve.add_argument("--prefix-cache-max", default=None, metavar="SIZE",
+                       help="its byte cap (512M, 2G, or bytes), LRU past it")
     _add_speculative(serve)
     _add_vision(serve)
     args = parser.parse_args(argv)
 
     try:
-        engine = Engine.open(args.model, backend=args.backend, budget=args.budget)
+        engine = Engine.open(args.model, backend=args.backend, budget=args.budget,
+                             prompt_cache=_caching(args, "prompt-cache"),
+                             prefix_cache=_caching(args, "prefix-cache"))
         # Before anything runs, so a package that cannot speculate says so here
         # and not half a generation later. `bench` takes no such flag: it is a
         # measurement. On `serve` the flag is a process-wide default (2026-10-01):

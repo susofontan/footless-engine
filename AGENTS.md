@@ -31,7 +31,7 @@ never an `if` on the model.
 | --- | --- |
 | `footless/sdk.py` | the contract as Python: `Facts`, `SamplingSpec`, `StepItem`, `StepResult`, errors, `RUNTIME_METHODS` |
 | `footless/manifest.py` | reading the manifest and verifying it against the disk and the facts |
-| `footless/engine.py` | `Engine` (open, `sequence`, `generate_tokens`, optional-verb gates), `Batcher` (scheduling), `PrefixCache`, `Ledger`, the loop guard |
+| `footless/engine.py` | `Engine` (open, `sequence`, `generate_tokens`, optional-verb gates), `Batcher` (scheduling), `PrefixCache`, `FileCache` (states saved on disk), `Ledger`, the loop guard |
 | `footless/serve.py`, `wire.py` | the HTTP front end and the OpenAI/vLLM wire shapes |
 | `footless/render.py`, `display.py` | output: thinking/content split, stop strings, tool calls; the terminal view |
 | `footless/decisions.py` | decision questions: rendering, labels, probabilities |
@@ -121,6 +121,11 @@ gates, and correctness gates come before speed. Then:
   of them (every decode, at most one prefill chunk); a step the budget refuses
   runs again without its youngest request, which waits in the prefix cache
   (2026-10-05).
+- States may be kept on disk in two caches the operator asks for, each with
+  its own directory and byte cap and LRU at the cap or a full disk:
+  `serve --prompt-cache` (a whole prompt's state, skipping its prefill) and
+  `--prefix-cache` (absorbed prefixes, beside the RAM cache), both via
+  `export_state` / `import_state` (2026-10-09).
 
 - Images cross the contract behind the `vision` capability, on only when the
   operator asks (`serve --vision`): `set_vision`, `chat_images` (prompt ids and
