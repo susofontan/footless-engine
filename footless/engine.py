@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import array
+import ctypes
 import errno
 import hashlib
 import importlib.util
@@ -11,7 +13,6 @@ import random
 import sys
 import threading
 import time
-import zlib
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -44,8 +45,15 @@ DEFAULT_MAX_TOKENS = 16384
 # context's cache and this many tokens' worth more, for its state's fixed part
 # and its growth. Alone, a request is always admitted.
 ADMIT_HEADROOM = 8192
-COMPRESS = 1  # zlib level for saved-state blobs: cheap, and they compress well
+# Saved states in flight, bounded by BYTES and not by job count: one blob can
+# be gigabytes. A save whose state, or whose runtime's export transient (the
+# export copies the state into its blob), cannot fit the memory left is not
+# saved: a cache never risks the machine it is speeding up. The queue's cap
+# is what waits in RAM to be written; the transient check is what a save may
+# briefly need beside its state.
+SAVE_QUEUE_BYTES = 2 << 30
 SAVE_QUEUE_MAX = 8  # queued saves kept; over that the oldest queued is dropped
+SAVE_TRANSIENT = 3  # a save's peak, in multiples of the state's own bytes
 
 # The repetition guard: how long a repeating tail may run before it is a loop.
 # A model that collapses repeats one span of tokens verbatim until the budget
@@ -212,6 +220,7 @@ class Ledger:
     """Byte accounting: the budget is the engine's to enforce."""
 
     def __init__(self, budget: int, evict) -> None:
+        self.declared = budget     # the opener's ceiling
         self.budget = budget
         self.used = 0
         self._evict = evict
@@ -239,8 +248,11 @@ class Ledger:
         Accounting protocol: a runtime whose device is smaller than the
         declared budget clamps it here, so states and cached clones are
         admitted against what the card actually has rather than meeting
-        cuMemAlloc mid-generation. Never GROWS past the opener's declaration."""
-        self.budget = min(self.budget, max(budget, 0))
+        cuMemAlloc mid-generation. Never GROWS past the opener's declaration,
+        and may move within it: a runtime answering memory pressure takes
+        the states' room away (the next claims evict) and gives it back when
+        the pressure passes."""
+        self.budget = min(self.declared, max(budget, 0))
 
 
 class HostBuffers:
@@ -284,9 +296,79 @@ def _canon(raw) -> tuple:
     return tuple(_canon(x) for x in raw) if isinstance(raw, list) else raw
 
 
+def _pack(key):
+    """A key for the indexes: the token ids as little-endian uint32 bytes
+    (four per token, against the ~36 a Python int costs in a tuple), so a
+    long session's key is a megabyte and not nine. A key with an image's
+    `(digest, index)` placeholders stays a tuple: its digests are part of the
+    key and no 32-bit word holds one. Both forms hash and compare exactly,
+    and both go through `_common`. Packing is idempotent: a packed key
+    passes through (a bytes iterable would otherwise be read as one int per
+    byte)."""
+    if isinstance(key, bytes):
+        return key
+    try:
+        return array.array("I", key).tobytes()
+    except (TypeError, ValueError, OverflowError):
+        return tuple(_canon(key))
+
+
 def _ident(key) -> str:
-    return hashlib.sha256(
-        json.dumps(_plain(key), separators=(",", ":")).encode()).hexdigest()
+    packed = _pack(key)
+    if not isinstance(packed, bytes):
+        packed = json.dumps(_plain(packed), separators=(",", ":")).encode()
+    return hashlib.sha256(packed).hexdigest()
+
+
+def _keylen(key) -> int:
+    """A packed key's tokens (its bytes are four per token)."""
+    return len(key) // 4 if isinstance(key, bytes) else len(key)
+
+
+def _key_json(key) -> list:
+    """A key as its `.key` file holds it: the token ids as a list (a packed
+    key unpacks; a key with image placeholders keeps them nested)."""
+    if isinstance(key, bytes):
+        return array.array("I", key).tolist()
+    return _plain(key)
+
+
+_CMP = ctypes.CDLL(None).memcmp
+_CMP.restype = ctypes.c_int
+_CMP.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+
+
+def _common(a, b) -> int:
+    """How many leading tokens two packed keys share. Packed bytes go
+    through `memcmp` in C -- the Python walk was the engine's slowest code at
+    cache scale (a second a lookup over long shared heads) -- and keys with
+    image placeholders walk."""
+    if isinstance(a, bytes) and isinstance(b, bytes):
+        aa = ctypes.cast(ctypes.c_char_p(a), ctypes.c_void_p).value
+        bb = ctypes.cast(ctypes.c_char_p(b), ctypes.c_void_p).value
+        lo, hi = 0, min(len(a), len(b)) // 4  # equal for lo words, unknown to hi
+        step = 4
+        while lo < hi and step < hi - lo:
+            if _CMP(aa + 4 * lo, bb + 4 * lo, 4 * step) == 0:
+                lo += step
+                step *= 2
+            else:
+                break
+        hi = min(lo + step, hi)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _CMP(aa, bb, 4 * mid) == 0:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+    a, b = tuple(a), tuple(b)
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
 
 
 class Ticket:
@@ -344,13 +426,13 @@ class FileCache:
     placeholders are its digest, as in `PrefixCache`).
 
     Each entry is `<sha256>.key` (its tokens) beside `<sha256>.state` (the
-    blob, zlib-compressed, written last and renamed into place, so a crash
-    never leaves half an entry). Order in `self._entries` is
-    least-recently-used first: a hit
+    blob, written last and renamed into place, so a crash never leaves half
+    an entry). Order in `self._entries` is least-recently-used first: a hit
     moves its entry to the end, and `save` drops the front while the cache is
     over `max_bytes` -- or while the filesystem has no room for the write. A
     cache never fails a request and never grows past its limit; a state that
-    cannot fit even an empty cache is simply not saved.
+    cannot fit even an empty cache -- or beside which its own export would
+    not fit the memory left -- is simply not saved.
 
     Disk work runs on ONE worker thread of its own, reads before saves (a
     request waits for a read; nobody waits for a save), so the engine thread
@@ -359,13 +441,15 @@ class FileCache:
     `load_async` / `begin_match` return a `Ticket` the request can wait on.
     """
 
-    def __init__(self, runtime, path, max_bytes: int, log=None) -> None:
+    def __init__(self, runtime, path, max_bytes: int, log=None, available=None) -> None:
         self._runtime = runtime
         self._log = log or (lambda level, message: None)
+        self.available = available    # the ledger's free bytes: room for transients
         self._path = Path(path)
         self._max_bytes = max(0, int(max_bytes))
         self._entries: "OrderedDict[tuple, tuple[str, int]]" = OrderedDict()
         self._total = 0
+        self._queued_bytes = 0       # raw bytes of the saves queued or running
         self._lock = threading.RLock()
         self._cond = threading.Condition(self._lock)
         self._reads: deque = deque()   # what a request waits for, taken first
@@ -380,7 +464,7 @@ class FileCache:
 
     def has(self, key) -> bool:
         with self._lock:
-            return tuple(key) in self._entries
+            return _pack(key) in self._entries
 
     def load(self, key) -> State | None:
         """The state saved under this whole key (an exact hit), or None."""
@@ -402,7 +486,7 @@ class FileCache:
     def load_async(self, key) -> Ticket:
         """Begin reading the state saved under this whole key (an exact
         hit); the ticket's `result()` is the state or None."""
-        key = tuple(key)
+        key = _pack(key)
         with self._lock:
             entry = self._entries.get(key)
         if entry is None:
@@ -412,7 +496,7 @@ class FileCache:
     def begin_match(self, key, min_len: int = 0) -> Ticket:
         """`match` begun: the file read runs beside the model and the
         ticket's `result()` is (state, matched) or None."""
-        key = tuple(key)
+        key = _pack(key)
         with self._lock:
             picked = self._pick(key, min_len)
         if picked is None:
@@ -421,19 +505,15 @@ class FileCache:
         return self._read(entry_key, entry, None if clean else matched,
                           lambda state: (state, matched))
 
-    def _pick(self, key: tuple, min_len: int):
+    def _pick(self, key, min_len: int):
         """(entry key, entry, matched, clean) for `match`'s ranking (its
         docstring is the rule), or None. Called under the lock."""
         best, best_len, best_clean = None, 0, False
         for entry_key in self._entries:
-            common = 0
-            for a, b in zip(entry_key, key):
-                if a != b:
-                    break
-                common += 1
+            common = _common(entry_key, key)
             if common <= min_len:
                 continue
-            clean = len(entry_key) == common
+            clean = _keylen(entry_key) == common
             if best is None or (clean, common) > (best_clean, best_len):
                 best, best_len, best_clean = entry_key, common, clean
         if best is None:
@@ -489,7 +569,7 @@ class FileCache:
         it on every path: written, dropped, refused. Without it the state is
         the caller's and may be reused imminently, so it is exported HERE
         and now and only its bytes move."""
-        key = tuple(key)
+        key = _pack(key)
         ticket = Ticket()
         with self._lock:
             known = key in self._entries or key in self._pending
@@ -500,15 +580,28 @@ class FileCache:
                 self._runtime.free_state(state)
             ticket.finish(None)
             return ticket
+        # the peak of a save is the state with the export's copies of it
+        # beside it: where that would not fit, the state is not saved -- a
+        # cache never risks the machine it is speeding up
+        size = self._runtime.state_nbytes(state)
+        if self.available is not None and SAVE_TRANSIENT * size > self.available():
+            self._log("info", f"a state of {size} B is not saved: its export wants "
+                              f"{SAVE_TRANSIENT * size} B beside it and "
+                              f"{self.available()} B are free")
+            if owned:
+                self._runtime.free_state(state)
+            ticket.finish(None)
+            return ticket
         blob = None
         if not owned:
             try:
                 blob = self._runtime.export_state(state)
+                size = len(blob)
             except Exception as exc:  # noqa: BLE001 - a cache never fails a request
                 self._log("warning", f"state not saved: {exc}")
                 ticket.finish(None)
                 return ticket
-        job = (key, blob, state, owned, ticket)
+        job = (key, blob, state, owned, ticket, size)
         dropped = []
         with self._cond:
             closed = self._stopped
@@ -516,20 +609,23 @@ class FileCache:
                 self._pending.add(key)
                 self._saves.append(job)
                 self._saving += 1
-                while len(self._saves) > SAVE_QUEUE_MAX:
+                self._queued_bytes += size
+                while len(self._saves) > SAVE_QUEUE_MAX \
+                        or self._queued_bytes > SAVE_QUEUE_BYTES:
                     drop = self._saves.popleft()
                     dropped.append(drop)
                     self._pending.discard(drop[0])
                     self._saving -= 1
+                    self._queued_bytes -= drop[5]
                 self._cond.notify_all()
         if closed:
             if owned:
                 self._runtime.free_state(state)
             ticket.finish(None)
             return ticket
-        for _, _, drop_state, drop_owned, drop_ticket in dropped:
-            self._log("info", f"save queue full ({SAVE_QUEUE_MAX} waiting): "
-                              f"the oldest queued state was dropped")
+        for _, _, drop_state, drop_owned, drop_ticket, _ in dropped:
+            self._log("info", f"save queue full ({SAVE_QUEUE_MAX} waiting or "
+                              f"{SAVE_QUEUE_BYTES} B): the oldest queued state was dropped")
             if drop_owned:
                 self._runtime.free_state(drop_state)
             drop_ticket.finish(None)
@@ -581,25 +677,27 @@ class FileCache:
                     self._run_read(*job)
                 else:
                     self._run_save(*job)
+            except Exception as exc:  # noqa: BLE001 - one job never kills the worker
+                self._log("warning", f"cache worker: {type(exc).__name__}: {exc}")
             finally:
                 with self._cond:
                     if not read:
                         self._saving -= 1
+                        self._queued_bytes -= job[5]
                         self._pending.discard(job[0])
                     self._cond.notify_all()
 
     def _run_read(self, key: tuple, ident: str, ticket: Ticket) -> None:
         try:
-            raw = ("ok", zlib.decompress(
-                (self._path / f"{ident}.state").read_bytes()))
+            raw = ("ok", (self._path / f"{ident}.state").read_bytes())
         except Exception as exc:  # noqa: BLE001 - unreadable: the settle drops it
             raw = ("bad", exc)
         ticket.finish(raw)
 
     def _run_save(self, key: tuple, blob, state, owned: bool,
-                  ticket: Ticket) -> None:
-        """One queued save: export (an owned state), compress, make room,
-        write. An owned state is freed whatever happens."""
+                  ticket: Ticket, size: int) -> None:
+        """One queued save: export (an owned state), make room, write. An
+        owned state is freed whatever happens."""
         try:
             if owned:
                 try:
@@ -607,8 +705,7 @@ class FileCache:
                 except Exception as exc:  # noqa: BLE001 - a cache never fails a request
                     self._log("warning", f"state not saved: {exc}")
                     return
-            data = zlib.compress(blob, COMPRESS)
-            size = len(data)
+            size = len(blob)
             if size > self._max_bytes:
                 self._log("info", f"a state of {size} B does not fit the cache's "
                                   f"{self._max_bytes} B: not saved")
@@ -618,7 +715,7 @@ class FileCache:
                 while self._total + size > self._max_bytes:
                     if not self._evict_lru():
                         break
-            if self._write(ident, key, data):
+            if self._write(ident, key, blob):
                 with self._lock:
                     self._entries[key] = (ident, size)
                     self._total += size
@@ -636,7 +733,7 @@ class FileCache:
         tmp = self._path / f"{ident}.state.tmp"
         while True:
             try:
-                kpath.write_text(json.dumps(_plain(key)))
+                kpath.write_text(json.dumps(_key_json(key)))
                 tmp.write_bytes(blob)
                 os.replace(tmp, spath)
                 return True
@@ -666,7 +763,7 @@ class FileCache:
             spath = kpath.with_suffix(".state")
             try:
                 found.append((kpath.stat().st_mtime, kpath.stem,
-                              _canon(json.loads(kpath.read_text())),
+                              _pack(_canon(json.loads(kpath.read_text()))),
                               spath.stat().st_size))
             except (OSError, ValueError):
                 continue
@@ -735,15 +832,11 @@ class PrefixCache:
         """This cache's answer for `tokens` begun -- (state, matched). The
         disk tier's read runs beside the model; the RAM side is taken when
         the ticket's `result()` is called."""
-        key = tuple(tokens)
-        best: tuple[int, ...] | None = None
+        key = _pack(tokens)
+        best = None
         best_len = 0
         for entry in self._entries:
-            common = 0
-            for a, b in zip(entry, key):
-                if a != b:
-                    break
-                common += 1
+            common = _common(entry, key)
             # a partial match truncates the clone, and a truncate may queue the
             # kept ids for re-forwarding in the next step (CONTRACT.md,
             # `truncate_state`) -- invisible here, which is why the rates book
@@ -782,7 +875,7 @@ class PrefixCache:
             self._runtime.truncate_state(state, best_len)
             return state, best_len
 
-        if self.files is not None and best_len < len(key):
+        if self.files is not None and best_len < _keylen(key):
             inner = self.files.begin_match(key, best_len)
             return Ticket(lambda _raw: settle(inner.result()), waiting=inner)
         ticket = Ticket(lambda _raw: settle(None))
@@ -794,7 +887,7 @@ class PrefixCache:
         return sum(self._runtime.state_nbytes(state) for state in self._entries.values())
 
     def store(self, tokens: list[int], state: State) -> None:
-        key = tuple(tokens)
+        key = _pack(tokens)
         old = self._entries.pop(key, None)
         if old is not None:
             self._runtime.free_state(old)
@@ -950,10 +1043,12 @@ class Engine:
         facts = runtime.open(str(model_dir), services)
         verify(model, facts)
         if prefix_cache is not None:
-            cache.files = FileCache(runtime, *prefix_cache, log=services.log)
+            cache.files = FileCache(runtime, *prefix_cache, log=services.log,
+                                    available=services.accounting.available)
         engine = cls(model, runtime, facts, services, cache)
         if prompt_cache is not None:
-            engine.prompt_cache = FileCache(runtime, *prompt_cache, log=services.log)
+            engine.prompt_cache = FileCache(runtime, *prompt_cache, log=services.log,
+                                            available=services.accounting.available)
         return engine
 
     def generate(

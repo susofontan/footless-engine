@@ -126,9 +126,14 @@ gates, and correctness gates come before speed. Then:
   its own directory and byte cap and LRU at the cap or a full disk:
   `serve --prompt-cache` (a whole prompt's state, skipping its prefill) and
   `--prefix-cache` (absorbed prefixes, beside the RAM cache), both via
-  `export_state` / `import_state` — entries zlib-compressed, a sentinel at
-  every cut point a hit was truncated to, saves and loads beside the model
-  (2026-10-09).
+  `export_state` / `import_state` — a sentinel at every cut point a hit was
+  truncated to, saves and loads beside the model, and a save whose export
+  would not fit the memory left beside its state is not made (2026-10-09).
+- The states' budget answers the machine: computed at open against the GPU
+  working set and the system's reserve (the log names which one governs),
+  and moved within that declaration by the system's memory pressure —
+  warning stops the states growing, critical evicts their oldest, a minute
+  of calm gives the room back (2026-10-10).
 
 - Images cross the contract behind the `vision` capability, on only when the
   operator asks (`serve --vision`): `set_vision`, `chat_images` (prompt ids and

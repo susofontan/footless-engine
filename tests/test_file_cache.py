@@ -16,13 +16,12 @@ import tempfile
 import threading
 import time
 import unittest
-import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from footless.cli import _caching, _size
-from footless.engine import COMPRESS, Admit, Engine, FileCache, Wait, Want
+from footless.engine import Admit, Engine, FileCache, Wait, Want
 from footless.sdk import ContractError
 
 MODEL = Path(__file__).resolve().parent / "mockup"
@@ -50,9 +49,10 @@ class FileCacheTest(unittest.TestCase):
 
     def _disk_size(self, tokens) -> int:
         """What a saved state's blob costs on disk: the cap counts file
-        bytes, and blobs are stored zlib-compressed."""
-        return len(zlib.compress(
-            self.engine.runtime.export_state(self._state(tokens)), COMPRESS))
+        bytes, and a blob is the export's bytes as they are (compression was
+        tried and dropped: ~1.1x on float states for gigabytes of transient
+        RAM at save time)."""
+        return len(self.engine.runtime.export_state(self._state(tokens)))
 
     def _cache(self, max_bytes: int, log=None) -> FileCache:
         cache = FileCache(self.engine.runtime, self.dir.name, max_bytes, log=log)
@@ -107,6 +107,43 @@ class FileCacheTest(unittest.TestCase):
         self.assertFalse(cache.has([1, 2, 3, 4, 5]))
         self.assertEqual(list(Path(self.dir.name).glob("*.state")), [])
 
+    def test_a_state_whose_export_would_not_fit_is_not_saved(self):
+        # the peak of a save is the state with the export's copies beside it:
+        # no room, and the state is not saved (here: nothing left at all)
+        log = []
+        cache = FileCache(self.engine.runtime, self.dir.name, 1 << 30,
+                          log=lambda level, msg: log.append(msg), available=lambda: 4)
+        self.addCleanup(cache.close)
+        owned = self._state([1])
+        cache.save([1], owned, owned=True)
+        cache.flush()
+        self.assertFalse(cache.has([1]))
+        self.assertIsNone(owned.claim, "an owned state is freed when it is not saved")
+        self.assertTrue(any("not saved" in m for m in log))
+
+    def test_image_placeholder_keys_never_match_another_image(self):
+        one = [1, 2, ("a" * 64, 0), 3]
+        other = [1, 2, ("b" * 64, 0), 3]
+        cache = self._cache(1 << 20)
+        cache.save(one, self._state(one))
+        cache.flush()
+        self.assertIsNotNone(cache.load(one))
+        self.assertIsNone(cache.load(other), "a state keyed on one image serves another")
+        self.assertFalse(cache.has(other))
+        hit = cache.match(other)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[1], 2, "the shared part stops before the image")
+
+    def test_packed_and_placeholder_keys_share_one_cache(self):
+        cache = self._cache(1 << 20)
+        cache.save([1, 2, 3], self._state([1, 2, 3]))
+        cache.save([1, 2, ("a" * 64, 0)], self._state([1, 2, 3]))
+        cache.flush()
+        self.assertTrue(cache.has([1, 2, 3]))
+        self.assertTrue(cache.has([1, 2, ("a" * 64, 0)]))
+        self.assertIsNone(cache.match([9, 9]))
+
+
     def test_an_unreadable_entry_is_a_miss_and_is_dropped(self):
         cache = self._cache(1 << 20)
         cache.save([1], self._state([1]))
@@ -116,15 +153,15 @@ class FileCacheTest(unittest.TestCase):
         self.assertIsNone(cache.load([1]))
         self.assertFalse(cache.has([1]))
 
-    def test_a_saved_state_round_trips_and_the_file_is_compressed(self):
+    def test_a_saved_state_round_trips_and_the_file_is_its_bytes(self):
         state = self._state([7] * 400)
         cache = self._cache(1 << 20)
         cache.save([7] * 400, state)
         cache.flush()
         (blob,) = Path(self.dir.name).glob("*.state")
-        self.assertLess(blob.stat().st_size,
-                        len(self.engine.runtime.export_state(state)),
-                        "a repetitive state stores smaller than its export")
+        self.assertEqual(blob.stat().st_size,
+                         len(self.engine.runtime.export_state(state)),
+                         "the file holds the export's bytes as they are")
         back = cache.load([7] * 400)
         self.assertIsNotNone(back)
         self.assertEqual(self.engine.runtime.export_state(back),
@@ -343,6 +380,20 @@ class FlagsTest(unittest.TestCase):
                      SimpleNamespace(prompt_cache_max="2G")):
             with self.assertRaises(ContractError):
                 _caching(args, "prompt-cache")
+
+
+
+class BudgetTest(unittest.TestCase):
+    """The states' budget: down under pressure, back within its declaration."""
+
+    def test_the_budget_shrinks_and_comes_back_but_never_past_declared(self):
+        from footless.engine import Ledger
+
+        ledger = Ledger(1000, lambda: False)
+        ledger.set_budget(400)                  # pressure takes room away
+        self.assertEqual(ledger.available(), 400)
+        ledger.set_budget(2000)                 # calm gives it back, capped
+        self.assertEqual(ledger.available(), 1000)
 
 
 if __name__ == "__main__":
