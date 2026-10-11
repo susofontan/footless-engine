@@ -12,6 +12,7 @@ entries go when the cap is reached, and when the filesystem is full.
 from __future__ import annotations
 
 import errno
+import json
 import tempfile
 import threading
 import time
@@ -242,6 +243,27 @@ class SentinelTest(unittest.TestCase):
                 self.assertEqual(state.tokens, [1, 2, 3, 4, 5])
             finally:
                 engine.close()        # before the directory goes away
+
+
+class SupersedeTest(unittest.TestCase):
+    def test_a_conversations_next_turn_replaces_its_saved_state(self):
+        """The prefix cache's saved copy of an entry a later turn supersedes
+        goes with the entry: one saved state a conversation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = Engine.open(MODEL, prefix_cache=(tmp, 1 << 20))
+            try:
+                rt = engine.runtime
+                first = engine.generate_tokens(rt.encode("user: hi"), 4)
+                engine.cache.files.flush()
+                self.assertEqual(len(list(Path(tmp).glob("*.state"))), 1)
+                turn2 = rt.encode("user: hi") + first.absorbed_tokens + rt.encode(" user: more")
+                engine.generate_tokens(turn2, 4)
+                engine.cache.files.flush()
+                saved = [json.loads(p.read_text()) for p in Path(tmp).glob("*.key")]
+                self.assertEqual(len(saved), 1, saved)
+                self.assertEqual(saved[0][:len(turn2)], turn2)
+            finally:
+                engine.close()
 
 
 class WaitTest(unittest.TestCase):

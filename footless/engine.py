@@ -550,6 +550,10 @@ class FileCache:
         return self._read(entry_key, entry, None if clean else matched,
                           lambda state: (state, matched))
 
+    def discard(self, key) -> None:
+        """Drop the state saved under this whole key, if there is one."""
+        self._drop(_pack(key))
+
     def match_len(self, key) -> int:
         """How many tokens of `key` the best saved state matches (no read)."""
         key = _pack(key)
@@ -993,6 +997,8 @@ class PrefixCache:
                 self._prompts.pop(supersedes, None)
                 if gone is not None:
                     self._runtime.free_state(gone)
+        if supersedes is not None and supersedes != key and self.files is not None:
+            self.files.discard(supersedes)      # its saved copy too: the new one holds it
 
     def evict_lru(self) -> bool:
         with self.lock:
