@@ -47,8 +47,12 @@ SHARED_CHUNK = 1024
 OVERLAP_CHUNK = 2048
 # The prefill a step runs is the one with the fewest prompt tokens left (a
 # short request is not held behind a long prompt's every chunk), unless one has
-# waited this long since its last chunk ran: the oldest such goes first.
-PREFILL_AGING = 5.0
+# waited this long since its last chunk ran: the oldest such goes first. A
+# safety net, not a time share: two long prompts at once are best served one
+# after the other (the first is through at half the time, the second as late
+# either way), and max_batch bounds how many short ones can keep a long one
+# waiting.
+PREFILL_AGING = 20.0
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
 # The room a request must find to be admitted beside others (Batcher): its
