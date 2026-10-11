@@ -442,6 +442,22 @@ class ServeTest(unittest.TestCase):
         self.assertEqual(body["usage"]["prompt_tokens"],
                          len("oracle: hi\nassistant: "))
 
+    def test_a_conversation_the_template_refuses_is_a_400(self):
+        """The package's template raising ValueError on the messages is the
+        request's fault: 400, as vLLM answers it, not a server error."""
+        runtime = self.api.engine.runtime
+        chat = runtime.chat
+
+        def refusing(messages, *args, **kwargs):
+            raise ValueError("System message must be at the beginning.")
+        runtime.chat = refusing
+        try:
+            status, body = self.chat()
+        finally:
+            runtime.chat = chat
+        self.assertEqual(status, 400)
+        self.assertIn("System message", body["error"]["message"])
+
     def test_developer_messages_are_system_messages(self):
         status, body = self.chat(messages=[
             {"role": "developer", "content": "sys"},

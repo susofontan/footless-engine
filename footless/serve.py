@@ -176,8 +176,13 @@ class FrontEnd:
         prompts: list[tuple[list[int], str]] = []  # (token ids, echoed text)
         images = []                                 # where the chat prompt's images sit
         if isinstance(request, wire.ChatRequest):
-            prompt = self.engine.chat_prompt(request.messages, request.thinking,
-                                             request.level, request.tools)
+            try:
+                prompt = self.engine.chat_prompt(request.messages, request.thinking,
+                                                 request.level, request.tools)
+            except ValueError as exc:
+                # the package's template refused the conversation: the
+                # request's fault, as vLLM answers it (400)
+                raise wire.ApiError(str(exc), param="messages") from None
             tokens, images = self._fit(prompt.tokens, request), prompt.images
             if images and len(tokens) != len(prompt.tokens):
                 raise wire.ApiError("truncate_prompt_tokens would cut a prompt that carries images",
