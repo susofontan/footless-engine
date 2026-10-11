@@ -45,6 +45,10 @@ SHARED_CHUNK = 1024
 # them, but a request arriving meanwhile waits for the chunk in flight before
 # its own prefill starts. SHARED_CHUNK again when another prefill is waiting.
 OVERLAP_CHUNK = 2048
+# The prefill a step runs is the one with the fewest prompt tokens left (a
+# short request is not held behind a long prompt's every chunk), unless one has
+# waited this long since its last chunk ran: the oldest such goes first.
+PREFILL_AGING = 5.0
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
 # The room a request must find to be admitted beside others (Batcher): its
@@ -1468,7 +1472,8 @@ class Engine:
                     o = matched + at
                     spans = [ImageSpan(sp.start - o, sp.length, sp.image) for sp in images
                              if sp.start < o + len(chunk) and sp.start + sp.length > o]
-                    result, elapsed = yield Want(StepItem(state, chunk, sample, spans), ctx)
+                    result, elapsed = yield Want(StepItem(state, chunk, sample, spans), ctx,
+                                                 left=len(fed) - at - len(chunk))
                     absorb(result)
                     # book the tokens that ran, not the tokens the request fed: a
                     # truncate can queue the kept prefix for re-forwarding inside
@@ -1584,10 +1589,12 @@ class Wait:
 
 @dataclass
 class Want:
-    """A sequence's item for the next step, and the context that may cancel it."""
+    """A sequence's item for the next step, and the context that may cancel
+    it; `left`: the prompt tokens still to feed after this item's."""
 
     item: StepItem
     ctx: StepContext
+    left: int = 0
 
 
 class Preempted(Exception):
@@ -1597,7 +1604,7 @@ class Preempted(Exception):
 class _Task:
     """One driven generator: what it waits for, and how it ended."""
 
-    __slots__ = ("gen", "want", "admitted", "done", "result", "error", "order")
+    __slots__ = ("gen", "want", "admitted", "done", "result", "error", "order", "since")
 
     def __init__(self, gen, order: int) -> None:
         self.gen = gen
@@ -1607,6 +1614,7 @@ class _Task:
         self.result = None
         self.error: BaseException | None = None
         self.order = order
+        self.since = 0.0        # when its last step landed (prefill aging)
 
 
 class _Flight:
@@ -1644,7 +1652,8 @@ class Batcher:
     others -- while the budget has room for what they ask (`Admit`: the ledger's
     free bytes and what the prefix cache could give back). Each `step` runs ONE
     runtime step over the admitted tasks: every decode, and at most one prefill
-    chunk (the oldest request's). A package that declares `concurrent_prefill`
+    chunk -- the one with the fewest prompt tokens left, unless one has waited
+    PREFILL_AGING since its last chunk (then the oldest such). A package that declares `concurrent_prefill`
     runs that chunk on a thread of its own instead (`_Flight`) while the
     decode steps go on: one prefill step in flight at a time, the decodes
     never waiting for it. A task waiting on work outside the model (`Wait`: a
@@ -1700,6 +1709,7 @@ class Batcher:
             # request's choices) asks again for each
             if isinstance(task.want, Admit):
                 task.admitted = False
+        task.since = time.perf_counter()
 
     def _room(self) -> int:
         return self.engine.services.accounting.available() + self.engine.cache.nbytes()
@@ -1715,6 +1725,17 @@ class Batcher:
         prefilling = sum(1 for t in live if isinstance(t.want, Want) and t.want.item.input_tokens)
         waiting = any(not t.admitted and not t.done for t in self.tasks)
         return SHARED_CHUNK if prefilling > 1 or waiting else OVERLAP_CHUNK
+
+    @staticmethod
+    def _next_prefill(prefills: list[_Task]) -> list[_Task]:
+        """The prefill to run: shortest remaining first, the starved first."""
+        if not prefills:
+            return []
+        now = time.perf_counter()
+        starved = [t for t in prefills if now - t.since >= PREFILL_AGING]
+        if starved:
+            return [min(starved, key=lambda t: t.since)]
+        return [min(prefills, key=lambda t: (len(t.want.item.input_tokens) + t.want.left, t.order))]
 
     def _land(self, flight: _Flight) -> None:
         """The prefill step in flight is done: its tasks go on, or take its
@@ -1770,10 +1791,10 @@ class Batcher:
         prefills = [t for t in stepping if t.want.item.input_tokens]
         if self._overlap:
             if prefills and self._flight is None:
-                self._flight = _Flight(engine, prefills[:1])
+                self._flight = _Flight(engine, self._next_prefill(prefills))
             batch = decodes
         else:
-            batch = decodes + prefills[:1]
+            batch = decodes + self._next_prefill(prefills)
         if not batch:
             if self._flight is not None:
                 # nothing to step beside it: wait for the prefill in flight

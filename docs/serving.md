@@ -22,7 +22,9 @@ front end in `footless/serve.py`.
 Requests run together. The engine's scheduler (`engine.Batcher`) admits them in
 arrival order, up to the package's `max_batch` at once and while the memory
 budget has room for them, and runs one `step` over all of them: every request
-that is decoding, and at most one prefill chunk — in chunks of 1024 tokens while
+that is decoding, and at most one prefill chunk — the request's with the
+fewest prompt tokens left, so a short prompt is not held behind a long one's
+every chunk (one passed over for 5 s goes first) — in chunks of 1024 tokens while
 others decode, so their tokens wait for one chunk at a time. A package that
 declares `concurrent_prefill` runs the prefill chunk on a thread of its own
 instead, one at a time, while the decode steps go on without waiting for it

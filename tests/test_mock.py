@@ -820,6 +820,48 @@ class BatcherTest(unittest.TestCase):
         self.assertEqual(second.result.text, self.SCRIPT_TEXT)
         self.assertTrue(any("budget refused" in m for m in logs), logs)
 
+    def test_a_short_prompt_is_not_held_behind_a_long_one(self):
+        """Prefill goes to the request with the fewest prompt tokens left: a
+        short prompt arriving while a long one is read is read first and
+        starts answering before the long one is through, with or without
+        concurrent_prefill; one passed over for PREFILL_AGING goes first (at
+        zero they take turns)."""
+        self.patch("CHUNK", 8)
+        self.patch("SHARED_CHUNK", 8)
+        self.patch("OVERLAP_CHUNK", 8)
+        fed = []
+        step = self.rt.step
+
+        def recording(batch, ctx):
+            fed.extend(chr(item.input_tokens[0]) for item in batch if item.input_tokens)
+            return step(batch, ctx)
+
+        self.rt.step = recording
+
+        def run(overlap):
+            if overlap and "concurrent_prefill" not in self.engine.facts.capabilities:
+                self.engine.facts.capabilities.append("concurrent_prefill")
+            self.engine.cache.free_all()            # the prompts are read again, not hit
+            order = []
+            batcher = Batcher(self.engine)
+            long = batcher.add(self.seq("L" * 120, 2, on_token=lambda t, tm: order.append("long")))
+            batcher.step()
+            fed.clear()
+            short = batcher.add(self.seq("S" * 40, 2, on_token=lambda t, tm: order.append("short")))
+            self.drain(batcher)
+            for task in (long, short):
+                self.assertIsNone(task.error)
+            return order, list(fed)
+
+        for overlap in (False, True):
+            order, chunks = run(overlap)
+            self.assertEqual(order[0], "short", (overlap, order))
+            self.assertEqual(chunks[:5], ["S"] * 5, "the short prompt's five chunks first")
+        self.patch("PREFILL_AGING", 0.0)            # always starved: they take turns
+        order, chunks = run(True)
+        self.assertEqual(order[0], "short")
+        self.assertIn("L", chunks[:5], "turns: the long prompt between the short one's chunks")
+
     def test_a_cancelled_request_ends_without_the_others(self):
         flag = _Flag()
         batcher = Batcher(self.engine)
