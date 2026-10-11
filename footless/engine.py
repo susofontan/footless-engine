@@ -54,11 +54,13 @@ OVERLAP_CHUNK = 2048
 # waiting.
 PREFILL_AGING = 20.0
 # Prompts this short ride along in the step of the prefill chosen (one step,
-# their whole prompt): a forward costs its weights again, ~170 ms of a short
-# prompt's own, and a ride-along costs the chosen one ~1 ms a token -- about
-# even at ~150 tokens, so only short ones join (two long prompts together
-# would only make the first one later).
-PACK_TOKENS = 192
+# their whole prompt): a forward costs its weights again, and a ride-along
+# costs the chosen one its rows. Measured (two prompts of n tokens, one step
+# against two): 32 -> 220 / 350 ms, 128 -> 446 / 569, 256 -> 760 / 864 -- the
+# first one later by ~1.2 ms a token, the second sooner by ~120 ms: even at
+# ~100-130 tokens, so only short ones join (two long prompts together would
+# only make the first one later).
+PACK_TOKENS = 128
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
 # The room a request must find to be admitted beside others (Batcher): its
