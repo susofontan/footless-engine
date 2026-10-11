@@ -146,6 +146,8 @@ gates, and correctness gates come before speed. Then:
 - Behind `concurrent_prefill` (a promise about `step`, no verb) the Batcher
   runs one prefill step at a time on a thread of its own while decode steps go
   on; the ledger and the prefix cache take one lock (2026-10-11).
+- `export_state` may return a `bytearray`: a large state's blob is built in
+  place, never copied again (2026-10-11).
 
 ## Not yet decided
 
