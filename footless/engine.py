@@ -1670,7 +1670,7 @@ class Batcher:
             if not task.done and isinstance(task.want, Wait) \
                     and task.want.ticket.ready():
                 self._advance(task)
-        ready = [t for t in live if not t.done and isinstance(task.want, Want)]
+        ready = [t for t in live if not t.done and isinstance(t.want, Want)]
         stepping = []
         for task in ready:
             if task.want.ctx.cancelled():

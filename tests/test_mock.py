@@ -719,6 +719,35 @@ class BatcherTest(unittest.TestCase):
         for task in (first, second, third):
             self.assertEqual(task.result.text, self.SCRIPT_TEXT)
 
+    def test_a_request_waiting_on_a_load_never_holds_up_the_others(self):
+        """One request waits for work outside the model (a saved state still
+        loading): the others step on meanwhile, whichever was admitted first."""
+        for waiter_first in (True, False):
+            ticket = engine_module.Ticket()
+
+            def waiting():
+                yield engine_module.Admit(0)
+                while not ticket.ready():
+                    yield engine_module.Wait(ticket)
+
+            batcher = Batcher(self.engine)
+            if waiter_first:
+                waiter = batcher.add(waiting())
+                runner = batcher.add(self.seq("runs on"))
+            else:
+                runner = batcher.add(self.seq("runs on"))
+                waiter = batcher.add(waiting())
+            for _ in range(200):
+                if runner.done:
+                    break
+                batcher.step()
+            self.assertIsNone(runner.error, waiter_first)
+            self.assertEqual(runner.result.text if runner.result else None,
+                             self.SCRIPT_TEXT, waiter_first)
+            self.assertFalse(waiter.done)
+            ticket.finish(None)
+            self.drain(batcher)
+
     def test_a_cancelled_request_ends_without_the_others(self):
         flag = _Flag()
         batcher = Batcher(self.engine)
