@@ -197,6 +197,25 @@ class MockModelTest(unittest.TestCase):
         self.assertEqual(second.timing.prefill_tokens, 2, "the prefix was re-forwarded")
         self.assertEqual(len(engine.cache._entries), 1)   # the continued state, stored back
 
+    def test_a_continued_conversation_keeps_one_entry(self):
+        """The next turn of a conversation supersedes the entry it started
+        from (it read past that entry's prompt): one entry a conversation,
+        not one a turn. A request that parts inside an entry's prompt (another
+        conversation on the same system prompt) leaves the entry alone."""
+        engine = self.engine
+        rt = engine.runtime
+        system = rt.encode("system: you are terse. ")
+        first = engine.generate_tokens(system + rt.encode("user: hi"), 4)
+        self.assertEqual(len(engine.cache._entries), 1)
+        turn2 = system + rt.encode("user: hi") + first.absorbed_tokens + rt.encode(" user: more")
+        engine.generate_tokens(turn2, 4)
+        self.assertEqual(len(engine.cache._entries), 1, "the first turn's entry stayed")
+        other = system + rt.encode("user: something else")
+        engine.generate_tokens(other, 4)
+        self.assertEqual(len(engine.cache._entries), 2, "a sibling conversation dropped the first")
+        prompts = sorted(engine.cache._prompts.values())
+        self.assertEqual(prompts, sorted([len(turn2), len(other)]))
+
     def test_a_failed_step_frees_the_request_state(self):
         runtime = self.engine.runtime
         made, freed = [], []

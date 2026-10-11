@@ -213,6 +213,15 @@ def _rewrite_cut(tokens: list[int]) -> int | None:
     return None
 
 
+def supersedes(source, matched: int):
+    """The prefix-cache entry a request's state makes redundant: the one it
+    started from, when it read past that entry's prompt (PrefixCache)."""
+    if source is None:
+        return None
+    key, prompt = source
+    return key if matched >= prompt else None
+
+
 def request_spec(sampling: SamplingSpec | None) -> SamplingSpec:
     """The request's sampling spec — one per-request draw stream.
 
@@ -404,12 +413,13 @@ class Ticket:
     consumes a ticket (the engine thread), so settling runs once.
     """
 
-    __slots__ = ("_event", "_raw", "_settle")
+    __slots__ = ("_event", "_raw", "_settle", "source")
 
     def __init__(self, settle=None, waiting: "Ticket | None" = None) -> None:
         self._event = waiting._event if waiting is not None else threading.Event()
         self._raw = None
         self._settle = settle
+        self.source = None      # a prefix-cache lookup: (entry key, its prompt length) it came from
 
     def ready(self) -> bool:
         return self._event.is_set()
@@ -835,12 +845,22 @@ class PrefixCache:
     `files` (a `FileCache`) is the second tier: states saved on disk, which
     survive a restart and a budget eviction. Memory wins a tie, a longer
     match from the files wins outright.
+
+    An entry remembers how much of its key was prompt. A request that
+    started from an entry and read past that entry's prompt (the next turn
+    of its conversation, which re-renders its answer, or the same prompt
+    again) supersedes it: when it stores its own state the entry goes --
+    that state holds everything of it a request can still ask for, and the
+    entry's answer is the part its client did not keep. A request that
+    parted inside the entry's prompt (another conversation sharing its
+    system prompt) leaves it alone.
     """
 
     def __init__(self, runtime: Runtime, available=None,
                  files: "FileCache | None" = None) -> None:
         self._runtime = runtime
         self._entries: "OrderedDict[tuple[int, ...], State]" = OrderedDict()
+        self._prompts: dict = {}     # an entry's key -> how much of it was prompt
         # the ledger's too (Engine.open): an eviction runs inside a claim, from
         # whichever thread claims. Held for the entries' bookkeeping (and the
         # frees an eviction does), never across a copy or a truncate
@@ -884,8 +904,10 @@ class PrefixCache:
             # (another request's step evicted it while the disk was read).
             with self.lock:
                 entry = self._entries.pop(best, None)
+                prompt = self._prompts.pop(best, _keylen(best))
             if entry is None:
                 return self._runtime.new_state(), 0
+            ticket.source = (best, prompt)
             fits = self.available is None or \
                 self._runtime.state_nbytes(entry) <= self.available()
             state = None
@@ -902,12 +924,14 @@ class PrefixCache:
                 return entry, best_len
             with self.lock:
                 self._entries[best] = entry
+                self._prompts[best] = prompt
             self._runtime.truncate_state(state, best_len)
             return state, best_len
 
         if self.files is not None and best_len < _keylen(key):
             inner = self.files.begin_match(key, best_len)
-            return Ticket(lambda _raw: settle(inner.result()), waiting=inner)
+            ticket = Ticket(lambda _raw: settle(inner.result()), waiting=inner)
+            return ticket
         ticket = Ticket(lambda _raw: settle(None))
         ticket.finish(None)
         return ticket
@@ -917,7 +941,11 @@ class PrefixCache:
         with self.lock:
             return sum(self._runtime.state_nbytes(state) for state in self._entries.values())
 
-    def store(self, tokens: list[int], state: State) -> None:
+    def store(self, tokens: list[int], state: State, prompt: int | None = None,
+              supersedes=None) -> None:
+        """Keep `state` under `tokens`, the first `prompt` of them prompt
+        (all, unsaid); `supersedes`: an entry key this state makes redundant
+        (the class docstring), dropped."""
         key = _pack(tokens)
         if self.files is not None:
             # saved before it joins the entries: once there, a claim on
@@ -928,12 +956,19 @@ class PrefixCache:
             if old is not None:
                 self._runtime.free_state(old)
             self._entries[key] = state
+            self._prompts[key] = _keylen(key) if prompt is None else min(prompt, _keylen(key))
+            if supersedes is not None and supersedes != key:
+                gone = self._entries.pop(supersedes, None)
+                self._prompts.pop(supersedes, None)
+                if gone is not None:
+                    self._runtime.free_state(gone)
 
     def evict_lru(self) -> bool:
         with self.lock:
             if not self._entries:
                 return False
-            _, state = self._entries.popitem(last=False)
+            key, state = self._entries.popitem(last=False)
+            self._prompts.pop(key, None)
             self._runtime.free_state(state)
             return True
 
@@ -1442,11 +1477,13 @@ class Engine:
                 state = ticket.result()
                 if state is not None:
                     matched = len(keyed)
+            source = None
             if state is None:
                 ticket = self.cache.begin_lookup(context)
                 while not ticket.ready():
                     yield Wait(ticket)
                 state, matched = ticket.result()
+                source = ticket.source
             if self.cache.files is not None and 0 < matched < len(context) \
                     and not self.cache.files.has(tuple(context[:matched])):
                 # what this hit was cut back to: the next turn usually
@@ -1535,7 +1572,8 @@ class Engine:
             except Preempted:
                 # the batch needs this request's room: its state waits in the
                 # prefix cache (evictable like any entry) for its next turn
-                self.cache.store(context[:matched + at] + generated[taken:], state)
+                self.cache.store(context[:matched + at] + generated[taken:], state, len(keyed),
+                                 supersedes(source, matched))
                 first = False
                 continue
             except BaseException:
@@ -1553,7 +1591,8 @@ class Engine:
         # The request is done with its state: the cache keeps it as is (a copy
         # would need the room of a second one, which a long conversation's
         # state does not leave)
-        self.cache.store(context[:matched + at] + generated[taken:], state)
+        self.cache.store(context[:matched + at] + generated[taken:], state, len(keyed),
+                         supersedes(source, matched))
         # the prompt tokens this request ran, a replay included: the rest
         # is what the cache really saved (usage's cached_tokens)
         fed_prompt = min(len(tokens), consumed + replayed)

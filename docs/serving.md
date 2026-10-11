@@ -39,6 +39,11 @@ request at the next step boundary.
 A package with `max_batch = 1` is served one request at a time, by the same
 code.
 
+A finished request leaves its state in the prefix cache (RAM, evicted
+least-recently-used first). The next turn of a conversation starts from a copy
+of it and, once done, replaces it: one entry a conversation, not one a turn.
+An entry another conversation only shares a head with (a system prompt) stays.
+
 ## Saved states on disk
 
 Two optional caches keep states in a directory of their own, each under a
