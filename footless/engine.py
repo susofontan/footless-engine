@@ -61,6 +61,11 @@ PREFILL_AGING = 20.0
 # ~100-130 tokens, so only short ones join (two long prompts together would
 # only make the first one later).
 PACK_TOKENS = 128
+# A request starting while another one reads a prompt that shares at least
+# this many more tokens with its own than any cached state does waits for
+# that one's state at the shared point instead of reading those tokens again
+# (agents started together on one system prompt and tools).
+SHARE_MIN = 256
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
 # The room a request must find to be admitted beside others (Batcher): its
@@ -545,6 +550,13 @@ class FileCache:
         return self._read(entry_key, entry, None if clean else matched,
                           lambda state: (state, matched))
 
+    def match_len(self, key) -> int:
+        """How many tokens of `key` the best saved state matches (no read)."""
+        key = _pack(key)
+        with self._lock:
+            picked = self._pick(key, 0)
+        return picked[2] if picked is not None else 0
+
     def _pick(self, key, min_len: int):
         """(entry key, entry, matched, clean) for `match`'s ranking (its
         docstring is the rule), or None. Called under the lock."""
@@ -944,6 +956,17 @@ class PrefixCache:
         ticket.finish(None)
         return ticket
 
+    def match_len(self, tokens) -> int:
+        """How many tokens of `tokens` the best cached state (RAM or disk)
+        would start with, without taking it."""
+        key = _pack(tokens)
+        with self.lock:
+            entries = list(self._entries)
+        best = max((_common(entry, key) for entry in entries), default=0)
+        if self.files is not None:
+            best = max(best, self.files.match_len(key))
+        return best
+
     def nbytes(self) -> int:
         """What the entries hold: room an eviction can give back."""
         with self.lock:
@@ -1037,6 +1060,18 @@ class Timing:
     decode_rates: Rates = field(default_factory=Rates)
 
 
+class _Producer:
+    """A request reading its prompt right now (`Engine.sequence`): its key,
+    how far it has read, and the points other requests wait for -- each a
+    ticket finished once the state there is in the prefix cache (or the
+    request will not get there)."""
+
+    __slots__ = ("key", "pos", "cuts")
+
+    def __init__(self, key, pos: int) -> None:
+        self.key, self.pos, self.cuts = key, pos, {}
+
+
 @dataclass
 class Prompt:
     """A conversation as the model reads it: tokens, and where its images sit."""
@@ -1092,6 +1127,7 @@ class Engine:
         # the saved-prompt tier (a `FileCache`), when the operator asked for
         # one: a whole prompt seen before starts past its prefill
         self.prompt_cache: FileCache | None = None
+        self._producers: list[_Producer] = []   # requests reading their prompt now
 
     @classmethod
     def open(
@@ -1486,6 +1522,12 @@ class Engine:
                 if state is not None:
                     matched = len(keyed)
             source = None
+            if state is None and first and not generated:
+                # another request is reading this prompt's head right now:
+                # its state there, once it gets there, instead of a second read
+                share = self._share(keyed)
+                while share is not None and not share.ready():
+                    yield Wait(share)
             if state is None:
                 ticket = self.cache.begin_lookup(context)
                 while not ticket.ready():
@@ -1509,10 +1551,18 @@ class Engine:
             fed = (list(tokens) + generated)[matched:]
             taken = len(generated)          # output this admission adds is past here
             at = 0                          # of `fed`, forwarded so far
+            producer = None
+            if first and fed:
+                producer = _Producer(_pack(keyed), matched)
+                self._producers.append(producer)
             try:
                 while at < len(fed):
-                    # the Batcher's size: smaller beside other requests
-                    chunk = fed[at:at + self._chunk]
+                    # the Batcher's size: smaller beside other requests, and
+                    # ending where another request waits for this state
+                    size = self._chunk
+                    if producer is not None and producer.cuts:
+                        size = min([size] + [c - matched - at for c in producer.cuts if c > matched + at])
+                    chunk = fed[at:at + size]
                     last = at + len(chunk) == len(fed)
                     # a step with no sampling spec samples nothing: max_tokens = 0
                     # is exactly zero output, and chunks before the last one never
@@ -1537,8 +1587,12 @@ class Engine:
                     at += len(chunk)
                     if first:
                         consumed = at
+                    if producer is not None:
+                        self._publish(producer, matched + at, state, keyed, sample is not None)
                     if finished or (max_tokens > 0 and len(generated) >= max_tokens):
                         break
+                self._unproduce(producer)
+                producer = None
 
                 if first and keyed and at == len(fed) \
                         and self.prompt_cache is not None and not self.prompt_cache.has(keyed):
@@ -1589,6 +1643,8 @@ class Engine:
                 # this request's alone, and nothing else would ever free it
                 self.runtime.free_state(state)
                 raise
+            finally:
+                self._unproduce(producer)
             break
         timing.total_seconds = time.perf_counter() - t_start
         result_tokens = generated if cut is None else generated[:cut]
@@ -1606,6 +1662,53 @@ class Engine:
         fed_prompt = min(len(tokens), consumed + replayed)
         return GenerationResult(text, result_tokens, fed_prompt, finished, timing,
                                 looped=cut is not None, absorbed_tokens=generated)
+
+    def _share(self, keyed: list) -> "Ticket | None":
+        """The point of another request's prompt this one should wait for
+        (SHARE_MIN more tokens than any cache gives, not read yet): its
+        ticket, or None."""
+        if not self._producers:
+            return None
+        key = _pack(keyed)
+        have = None
+        best, best_len = None, 0
+        for p in self._producers:
+            n = _common(p.key, key)
+            if n <= best_len or n <= p.pos:
+                continue
+            if have is None:
+                have = self.cache.match_len(key)
+            if n - have >= SHARE_MIN:
+                best, best_len = p, n
+        if best is None:
+            return None
+        return best.cuts.setdefault(best_len, Ticket())
+
+    def _publish(self, producer: _Producer, pos: int, state, keyed: list, sampled: bool) -> None:
+        """The producer's state is at `pos`: a copy of it there joins the
+        prefix cache for the requests waiting at `pos` (one past it is no
+        longer reachable: they go on without it)."""
+        producer.pos = pos
+        for cut in sorted(c for c in producer.cuts if c <= pos):
+            ticket = producer.cuts.pop(cut)
+            if cut == pos:
+                try:
+                    kept = self.runtime.clone_state(state)
+                    if sampled:            # the step drew the first token: back to the prompt
+                        self.runtime.truncate_state(kept, pos)
+                    self.cache.store(keyed[:pos], kept, pos)
+                except BudgetRefused:
+                    pass
+            ticket.finish(None)
+
+    def _unproduce(self, producer: "_Producer | None") -> None:
+        if producer is None:
+            return
+        if producer in self._producers:
+            self._producers.remove(producer)
+        for ticket in producer.cuts.values():
+            ticket.finish(None)
+        producer.cuts.clear()
 
     def close(self) -> None:
         if self.prompt_cache is not None:

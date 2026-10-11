@@ -43,6 +43,10 @@ A finished request leaves its state in the prefix cache (RAM, evicted
 least-recently-used first). The next turn of a conversation starts from a copy
 of it and, once done, replaces it: one entry a conversation, not one a turn.
 An entry another conversation only shares a head with (a system prompt) stays.
+Requests that arrive together on one long head (agents started at once on
+one system prompt and tools) read it once: the later one waits until the
+first has read the shared part, starts from a copy of its state there, and
+reads only its own tail.
 
 ## Saved states on disk
 

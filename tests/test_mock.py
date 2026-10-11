@@ -899,6 +899,44 @@ class BatcherTest(unittest.TestCase):
         self.assertEqual(fed[:2], [[5, 10, 12], [30]], "the shortest, the short ones beside it, then 30")
         self.assertEqual([t.result.text for t in tasks], [self.SCRIPT_TEXT] * 4)
 
+    def test_requests_started_together_read_a_shared_head_once(self):
+        """Two requests arriving together whose prompts share a long head:
+        the second waits for the first's state at the shared point (a copy
+        joins the prefix cache there) and reads only its own tail; both
+        answer as alone."""
+        self.patch("SHARE_MIN", 16)
+        self.patch("CHUNK", 32)
+        self.patch("SHARED_CHUNK", 32)
+        head = "h" * 100
+        batcher = Batcher(self.engine)
+        a = batcher.add(self.seq(head + "first tail"))
+        b = batcher.add(self.seq(head + "second, longer tail"))
+        self.drain(batcher)
+        self.assertEqual(a.result.text, self.SCRIPT_TEXT)
+        self.assertEqual(b.result.text, self.SCRIPT_TEXT)
+        self.assertEqual(a.result.prompt_tokens_fed, 110)
+        self.assertEqual(b.result.prompt_tokens_fed, len("second, longer tail"))
+        self.assertEqual(self.engine._producers, [])
+
+    def test_a_shared_head_cut_short_lets_the_waiting_request_go_on(self):
+        """The request a second one waits for ends before the shared point
+        (cancelled): the second reads its whole prompt itself."""
+        self.patch("SHARE_MIN", 16)
+        self.patch("CHUNK", 8)
+        self.patch("SHARED_CHUNK", 8)
+        flag = _Flag()
+        head = "h" * 100
+        batcher = Batcher(self.engine)
+        a = batcher.add(self.seq(head + "first", ctx=flag))
+        b = batcher.add(self.seq(head + "second"))
+        batcher.step()
+        batcher.step()
+        flag.on = True
+        self.drain(batcher)
+        self.assertIsNone(b.error)
+        self.assertEqual(b.result.text, self.SCRIPT_TEXT)
+        self.assertEqual(self.engine._producers, [])
+
     def test_a_cancelled_request_ends_without_the_others(self):
         flag = _Flag()
         batcher = Batcher(self.engine)
