@@ -258,6 +258,10 @@ class Ledger:
     def __init__(self, budget: int, evict, lock=None) -> None:
         self.declared = budget     # the opener's ceiling
         self.budget = budget
+        # the most the runtime's set_budget has given (its room at open):
+        # what live requests may take whatever memory pressure says, which
+        # lowers `budget` only -- the cache's room (None: never set)
+        self.ceiling: int | None = None
         self.used = 0
         self._evict = evict
         # claims come from every thread that runs the model (a prefill step
@@ -271,12 +275,26 @@ class Ledger:
         with self._lock:
             while self.used + nbytes > self.budget:
                 if not self._evict():
-                    raise BudgetRefused(
-                        f"budget {self.budget}B cannot admit {nbytes}B "
-                        f"({self.used}B used, nothing left to evict)"
-                    )
+                    break
+            # past a budget memory pressure lowered, with every cached state
+            # gone: a live request still has its room, up to the ceiling
+            if self.used + nbytes > self.limit():
+                raise BudgetRefused(
+                    f"budget {self.limit()}B cannot admit {nbytes}B "
+                    f"({self.used}B used, nothing left to evict)"
+                )
             self.used += nbytes
         return Claim(nbytes)
+
+    def limit(self) -> int:
+        """What live requests may hold: the ceiling, or the budget before
+        any set_budget."""
+        return self.budget if self.ceiling is None else max(self.ceiling, self.budget)
+
+    def headroom(self) -> int:
+        """Room left for live requests (admission), pressure aside."""
+        with self._lock:
+            return self.limit() - self.used
 
     def release(self, claim: Claim) -> None:
         with self._lock:
@@ -293,10 +311,12 @@ class Ledger:
         admitted against what the card actually has rather than meeting
         cuMemAlloc mid-generation. Never GROWS past the opener's declaration,
         and may move within it: a runtime answering memory pressure takes
-        the states' room away (the next claims evict) and gives it back when
-        the pressure passes."""
+        the states' room away (the next claims evict cached states) and gives
+        it back when the pressure passes. The most it has set is the ceiling:
+        a lowered budget evicts the cache, never refuses a live request."""
         with self._lock:
             self.budget = min(self.declared, max(budget, 0))
+            self.ceiling = self.budget if self.ceiling is None else max(self.ceiling, self.budget)
 
 
 class HostBuffers:
@@ -1471,7 +1491,8 @@ class Engine:
         # not after the minutes of prefill it takes to reach the limit (the
         # state's fixed part is the model's and not counted: this is the floor)
         need = self.facts.cache_bytes_per_token * len(tokens)
-        budget = getattr(self.services.accounting, "budget", None)
+        limit = getattr(self.services.accounting, "limit", None)
+        budget = limit() if limit is not None else getattr(self.services.accounting, "budget", None)
         if budget is not None and need > budget:
             raise BudgetRefused(
                 f"prompt is {len(tokens)} tokens: its cache needs {need} B, more than "
@@ -1873,7 +1894,12 @@ class Batcher:
         task.since = time.perf_counter()
 
     def _room(self) -> int:
-        return self.engine.services.accounting.available() + self.engine.cache.nbytes()
+        """Room a request asks for at admission: what live requests may take
+        (memory pressure shrinks the cache, not this) and what the cache
+        could give back."""
+        acc = self.engine.services.accounting
+        free = acc.headroom() if hasattr(acc, "headroom") else acc.available()
+        return free + self.engine.cache.nbytes()
 
     def _chunk(self, live: list[_Task]) -> int:
         """The prefill chunk a sequence cuts next: CHUNK alone; beside

@@ -134,6 +134,10 @@ gates, and correctness gates come before speed. Then:
   and moved within that declaration by the system's memory pressure —
   warning stops the states growing, critical evicts their oldest, a minute
   of calm gives the room back (2026-10-10).
+- Memory pressure takes the cache's room only: a lowered budget evicts cached
+  states, while live requests are admitted and served against the ceiling
+  (the most `set_budget` gave) -- it had refused a 110k-token conversation
+  against a pressure budget of 1.7 GB (2026-10-12).
 
 - Images cross the contract behind the `vision` capability, on only when the
   operator asks (`serve --vision`): `set_vision`, `chat_images` (prompt ids and

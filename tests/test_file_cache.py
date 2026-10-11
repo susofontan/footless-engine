@@ -418,5 +418,44 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(ledger.available(), 1000)
 
 
+    def test_pressure_evicts_the_cache_but_never_refuses_a_live_request(self):
+        """A budget lowered by memory pressure evicts cached states on the
+        next claim; with nothing left to evict a live request still gets its
+        room up to the ceiling (the most set_budget gave), and only past it
+        is refused."""
+        from footless.engine import Ledger
+        from footless.sdk import BudgetRefused
+
+        cached = []                             # two cached states' claims
+
+        def evict():
+            if not cached:
+                return False
+            ledger.release(cached.pop())
+            return True
+        ledger = Ledger(10_000, evict)
+        ledger.set_budget(1000)                 # the runtime's room at open: the ceiling
+        cached += [ledger.claim(100), ledger.claim(100)]
+        ledger.set_budget(100)                  # critical pressure
+        ledger.claim(600)                       # a live request: the cache goes, the claim stays
+        self.assertEqual((cached, ledger.used), ([], 600))
+        self.assertEqual(ledger.headroom(), 400)
+        with self.assertRaises(BudgetRefused):
+            ledger.claim(500)                   # past the ceiling
+        ledger.set_budget(1000)
+        self.assertEqual(ledger.limit(), 1000)
+
+    def test_a_long_prompt_runs_under_pressure(self):
+        """The whole-budget refusal at a request's start reads the ceiling:
+        pressure is not a reason to refuse a conversation that fits it."""
+        engine = Engine.open(MODEL)
+        try:
+            engine.services.accounting.set_budget(8 * 200)
+            engine.services.accounting.set_budget(8 * 20)      # pressure
+            result = engine.generate("x" * 100, 8)
+            self.assertTrue(result.tokens)
+        finally:
+            engine.close()
+
 if __name__ == "__main__":
     unittest.main()
