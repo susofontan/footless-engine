@@ -881,6 +881,24 @@ class BatcherTest(unittest.TestCase):
         self.assertEqual(order[0], "short")
         self.assertIn("L", chunks[:5], "turns: the long prompt between the short one's chunks")
 
+    def test_short_prompts_ride_along_in_one_prefill_step(self):
+        """Prompts of at most PACK_TOKENS that fit whole join the chosen
+        prefill's step; a longer one, or one cut in chunks, waits its turn."""
+        fed = []
+        step = self.rt.step
+
+        def recording(batch, ctx):
+            fed.append(sorted(len(item.input_tokens) for item in batch if item.input_tokens))
+            return step(batch, ctx)
+
+        self.rt.step = recording
+        self.patch("PACK_TOKENS", 12)
+        batcher = Batcher(self.engine)
+        tasks = [batcher.add(self.seq(text)) for text in ("a" * 30, "b" * 10, "c" * 12, "d" * 5)]
+        self.drain(batcher)
+        self.assertEqual(fed[:2], [[5, 10, 12], [30]], "the shortest, the short ones beside it, then 30")
+        self.assertEqual([t.result.text for t in tasks], [self.SCRIPT_TEXT] * 4)
+
     def test_a_cancelled_request_ends_without_the_others(self):
         flag = _Flag()
         batcher = Batcher(self.engine)

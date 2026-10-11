@@ -53,6 +53,12 @@ OVERLAP_CHUNK = 2048
 # either way), and max_batch bounds how many short ones can keep a long one
 # waiting.
 PREFILL_AGING = 20.0
+# Prompts this short ride along in the step of the prefill chosen (one step,
+# their whole prompt): a forward costs its weights again, ~170 ms of a short
+# prompt's own, and a ride-along costs the chosen one ~1 ms a token -- about
+# even at ~150 tokens, so only short ones join (two long prompts together
+# would only make the first one later).
+PACK_TOKENS = 192
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
 # The room a request must find to be admitted beside others (Batcher): its
@@ -1696,7 +1702,8 @@ class Batcher:
     free bytes and what the prefix cache could give back). Each `step` runs ONE
     runtime step over the admitted tasks: every decode, and at most one prefill
     chunk -- the one with the fewest prompt tokens left, unless one has waited
-    PREFILL_AGING since its last chunk (then the oldest such). A package that declares `concurrent_prefill`
+    PREFILL_AGING since its last chunk (then the oldest such), with the short
+    prompts (PACK_TOKENS) that fit beside it whole. A package that declares `concurrent_prefill`
     runs that chunk on a thread of its own instead (`_Flight`) while the
     decode steps go on: one prefill step in flight at a time, the decodes
     never waiting for it. A task waiting on work outside the model (`Wait`: a
@@ -1769,16 +1776,24 @@ class Batcher:
         waiting = any(not t.admitted and not t.done for t in self.tasks)
         return SHARED_CHUNK if prefilling > 1 or waiting else OVERLAP_CHUNK
 
-    @staticmethod
-    def _next_prefill(prefills: list[_Task]) -> list[_Task]:
-        """The prefill to run: shortest remaining first, the starved first."""
+    def _next_prefill(self, prefills: list[_Task]) -> list[_Task]:
+        """The prefills a step runs: the one with the fewest tokens left (the
+        starved first), and the short prompts that fit beside it whole."""
         if not prefills:
             return []
         now = time.perf_counter()
         starved = [t for t in prefills if now - t.since >= PREFILL_AGING]
-        if starved:
-            return [min(starved, key=lambda t: t.since)]
-        return [min(prefills, key=lambda t: (len(t.want.item.input_tokens) + t.want.left, t.order))]
+        remaining = lambda t: (len(t.want.item.input_tokens) + t.want.left, t.order)  # noqa: E731
+        first = min(starved, key=lambda t: t.since) if starved else min(prefills, key=remaining)
+        chosen, rows = [first], len(first.want.item.input_tokens)
+        for task in sorted(prefills, key=remaining):
+            n = len(task.want.item.input_tokens)
+            if task is first or task.want.left or n > PACK_TOKENS or rows + n > CHUNK \
+                    or len(chosen) >= self.engine.facts.max_batch:
+                continue
+            chosen.append(task)
+            rows += n
+        return chosen
 
     def _land(self, flight: _Flight) -> None:
         """The prefill step in flight is done: its tasks go on, or take its
