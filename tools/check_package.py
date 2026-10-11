@@ -18,7 +18,9 @@ already compares the manifest with the runtime's facts (rule 3). What follows:
                      leaves the batch as it was (max_batch >= 2)
   prefix cache       a repeated prompt reuses the cache and answers the same
   capabilities       label_logprobs, tool_calls and speculative, when declared
-                     (speculation must not change one token)
+                     (speculation must not change one token); concurrent_prefill:
+                     a prefill step on another thread while a state decodes
+                     changes no token of either
   accounting         everything freed, the ledger is back to zero
   vision             when declared (last: turning it on may keep a claim):
                      chat_images' tokens and spans, greedy determinism with an
@@ -34,6 +36,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -41,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from footless.engine import DEFAULT_BUDGET, Engine, StepContext  # noqa: E402
 from footless.sdk import (  # noqa: E402
-    LABEL_LOGPROBS, TOOL_CALLS, VISION, Image, ImageSpan, BudgetRefused, ContractError, SamplingSpec, StepItem,
+    CONCURRENT_PREFILL, LABEL_LOGPROBS, TOOL_CALLS, VISION, Image, ImageSpan, BudgetRefused, ContractError, SamplingSpec, StepItem,
 )
 
 GREEDY = SamplingSpec(temperature=0.0, top_k=1, top_p=1.0, seed=1)
@@ -319,6 +322,37 @@ class Checker:
         want = self.reference_long
         assert got == want, "speculation changed the tokens"
 
+    def concurrent_prefill(self):
+        if CONCURRENT_PREFILL not in self.engine.facts.capabilities:
+            raise Skip("not declared")
+        long, short = self._prompts(2)
+        alone = [self.run_from(long), self.run_from(short)]
+        a, b = self.state(), self.state()
+        got_b = [self.feed(b, short).token]
+        got_a, failed = [], []
+
+        def prefill():
+            try:
+                got_a.append(self.feed(a, long).token)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                failed.append(exc)
+        worker = threading.Thread(target=prefill)
+        worker.start()
+        beside = 0
+        while worker.is_alive() and len(got_b) <= self.n:
+            got_b.append(self.decode(b, 1)[0])
+            beside += 1
+        worker.join()
+        if failed:
+            raise failed[0]
+        got_a += self.decode(a)
+        got_b += self.decode(b, self.n + 1 - len(got_b))
+        self.free(a)
+        self.free(b)
+        assert got_a == alone[0], "the prefill beside decode steps answers differently"
+        assert got_b == alone[1], "decode steps beside a prefill answer differently"
+        return f"{beside} decode steps beside the prefill"
+
     def vision(self):
         if VISION not in self.engine.facts.capabilities:
             raise Skip("not declared")
@@ -417,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
         c.check("label_logprobs", c.label_logprobs)
         c.check("tool_calls", c.tool_calls)
         c.check("speculative", c.speculative)
+        c.check("concurrent_prefill", c.concurrent_prefill)
         c.check("accounting back to zero", c.accounting)
         c.check("vision", c.vision)
     finally:

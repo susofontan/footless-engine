@@ -23,7 +23,10 @@ Requests run together. The engine's scheduler (`engine.Batcher`) admits them in
 arrival order, up to the package's `max_batch` at once and while the memory
 budget has room for them, and runs one `step` over all of them: every request
 that is decoding, and at most one prefill chunk — in chunks of 1024 tokens while
-others decode, so their tokens wait for one chunk at a time. How the rows of
+others decode, so their tokens wait for one chunk at a time. A package that
+declares `concurrent_prefill` runs the prefill chunk on a thread of its own
+instead, one at a time, while the decode steps go on without waiting for it
+(chunks of 2048 beside others, 1024 when another prefill waits). How the rows of
 one step are computed is the package's business; each item's result must be
 the one it would get alone (CONTRACT.md). A step the budget refuses runs again
 without its youngest request: that one waits in the prefix cache and is

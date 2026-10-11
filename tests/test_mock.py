@@ -748,6 +748,78 @@ class BatcherTest(unittest.TestCase):
             ticket.finish(None)
             self.drain(batcher)
 
+    def overlap(self, prefill_seconds: float):
+        """The mock as a package that declares concurrent_prefill, its
+        prefill steps taking a while: the steps it ran, with the thread
+        each ran on and whether a prefill was running meanwhile."""
+        import threading
+        self.engine.facts.capabilities.append("concurrent_prefill")
+        log, inside = [], []
+        step = self.rt.step
+
+        def slow(batch, ctx):
+            prefill = any(item.input_tokens for item in batch)
+            log.append((prefill, threading.current_thread().name, bool(inside)))
+            if prefill:
+                inside.append(1)
+                time.sleep(prefill_seconds)
+                try:
+                    return step(batch, ctx)
+                finally:
+                    inside.pop()
+            return step(batch, ctx)
+
+        self.rt.step = slow
+        return log
+
+    def test_with_concurrent_prefill_decodes_go_on_beside_a_prefill(self):
+        """A package that declares concurrent_prefill: a long prompt's chunks
+        run on a thread of their own, one at a time, while the requests
+        already decoding step on -- prefill and decode never share a step,
+        and every answer is the one it gets alone."""
+        self.patch("OVERLAP_CHUNK", 16)
+        log = self.overlap(0.02)
+        batcher = Batcher(self.engine)
+        first = batcher.add(self.seq("short"))
+        batcher.step()
+        while not batcher._flight is None:
+            batcher.step()
+        second = batcher.add(self.seq("z" * 120))
+        self.drain(batcher)
+        self.assertEqual(first.result.text, self.SCRIPT_TEXT)
+        self.assertEqual(second.result.text, self.SCRIPT_TEXT)
+        beside = [entry for entry in log if not entry[0] and entry[2]]
+        self.assertTrue(beside, "no decode step ran while a prefill was in flight")
+        prefill_threads = {name for prefill, name, _ in log if prefill}
+        self.assertEqual(prefill_threads, {"footless-prefill"})
+        self.assertFalse(any(prefill and busy for prefill, _, busy in log),
+                         "two prefill steps at once")
+
+    def test_with_concurrent_prefill_a_refused_prefill_waits_for_room(self):
+        """A prefill step the budget refuses beside a running request is
+        preempted (it waits for room), not failed; both answers come out."""
+        self.patch("ADMIT_HEADROOM", 0)
+        self.patch("OVERLAP_CHUNK", 8)
+        self.patch("SHARED_CHUNK", 8)
+        engine = Engine.open(MODEL, budget=8 * 123)
+        self.addCleanup(engine.close)
+        engine.facts.capabilities.append("concurrent_prefill")
+        logs = []
+        engine.services.log = lambda level, message: logs.append(message)
+        batcher = Batcher(engine)
+        first = batcher.add(engine.sequence(engine.runtime.encode("x" * 10), 64))
+        for _ in range(3):
+            batcher.step()
+        second = batcher.add(engine.sequence(engine.runtime.encode("y" * 100), 64))
+        for _ in range(10000):
+            if not batcher.busy():
+                break
+            batcher.step()
+        self.assertIsNone(second.error)
+        self.assertEqual(first.result.text, self.SCRIPT_TEXT)
+        self.assertEqual(second.result.text, self.SCRIPT_TEXT)
+        self.assertTrue(any("budget refused" in m for m in logs), logs)
+
     def test_a_cancelled_request_ends_without_the_others(self):
         flag = _Flag()
         batcher = Batcher(self.engine)

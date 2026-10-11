@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .manifest import Manifest, read as read_manifest, verify, verify_backends
 from .sdk import (
+    CONCURRENT_PREFILL,
     LABEL_LOGPROBS,
     TOOL_CALLS,
     VISION,
@@ -39,6 +40,11 @@ CHUNK = 4096  # prefill is fed in chunks; only the last one samples
 # A prefill that shares its steps with other requests' decodes goes in chunks of
 # this many tokens instead: each of their tokens waits for one chunk.
 SHARED_CHUNK = 1024
+# Beside other requests, a package that runs prefill steps beside decode steps
+# (`concurrent_prefill`) takes chunks of this many: the decodes do not wait for
+# them, but a request arriving meanwhile waits for the chunk in flight before
+# its own prefill starts. SHARED_CHUNK again when another prefill is waiting.
+OVERLAP_CHUNK = 2048
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
 # The room a request must find to be admitted beside others (Batcher): its
@@ -219,29 +225,36 @@ def request_spec(sampling: SamplingSpec | None) -> SamplingSpec:
 class Ledger:
     """Byte accounting: the budget is the engine's to enforce."""
 
-    def __init__(self, budget: int, evict) -> None:
+    def __init__(self, budget: int, evict, lock=None) -> None:
         self.declared = budget     # the opener's ceiling
         self.budget = budget
         self.used = 0
         self._evict = evict
+        # claims come from every thread that runs the model (a prefill step
+        # beside decode steps, a cache worker freeing a state): the prefix
+        # cache's lock, since a claim may evict one of its entries
+        self._lock = lock if lock is not None else threading.RLock()
 
     def claim(self, nbytes: int) -> Claim:
         if nbytes < 0:
             raise ContractError(f"negative claim: {nbytes}")
-        while self.used + nbytes > self.budget:
-            if not self._evict():
-                raise BudgetRefused(
-                    f"budget {self.budget}B cannot admit {nbytes}B "
-                    f"({self.used}B used, nothing left to evict)"
-                )
-        self.used += nbytes
+        with self._lock:
+            while self.used + nbytes > self.budget:
+                if not self._evict():
+                    raise BudgetRefused(
+                        f"budget {self.budget}B cannot admit {nbytes}B "
+                        f"({self.used}B used, nothing left to evict)"
+                    )
+            self.used += nbytes
         return Claim(nbytes)
 
     def release(self, claim: Claim) -> None:
-        self.used -= claim.nbytes
+        with self._lock:
+            self.used -= claim.nbytes
 
     def available(self) -> int:
-        return self.budget - self.used
+        with self._lock:
+            return self.budget - self.used
 
     def set_budget(self, budget: int) -> None:
         """Re-base the budget on the device's truth. Optional on the
@@ -252,7 +265,8 @@ class Ledger:
         and may move within it: a runtime answering memory pressure takes
         the states' room away (the next claims evict) and gives it back when
         the pressure passes."""
-        self.budget = min(self.declared, max(budget, 0))
+        with self._lock:
+            self.budget = min(self.declared, max(budget, 0))
 
 
 class HostBuffers:
@@ -819,6 +833,10 @@ class PrefixCache:
                  files: "FileCache | None" = None) -> None:
         self._runtime = runtime
         self._entries: "OrderedDict[tuple[int, ...], State]" = OrderedDict()
+        # the ledger's too (Engine.open): an eviction runs inside a claim, from
+        # whichever thread claims. Held for the entries' bookkeeping (and the
+        # frees an eviction does), never across a copy or a truncate
+        self.lock = threading.RLock()
         # the ledger's free bytes (set by Engine.open): a copy that would not
         # fit beside the entry hands the entry itself over instead
         self.available = available
@@ -835,7 +853,9 @@ class PrefixCache:
         key = _pack(tokens)
         best = None
         best_len = 0
-        for entry in self._entries:
+        with self.lock:
+            entries = list(self._entries)
+        for entry in entries:
             common = _common(entry, key)
             # a partial match truncates the clone, and a truncate may queue the
             # kept ids for re-forwarding in the next step (CONTRACT.md,
@@ -854,7 +874,8 @@ class PrefixCache:
             # out of the cache while it is copied: making room for the copy may
             # evict entries, and never this one. It may even be gone by now
             # (another request's step evicted it while the disk was read).
-            entry = self._entries.pop(best, None)
+            with self.lock:
+                entry = self._entries.pop(best, None)
             if entry is None:
                 return self._runtime.new_state(), 0
             fits = self.available is None or \
@@ -871,7 +892,8 @@ class PrefixCache:
                 # a fresh state would re-forward the whole prefix
                 self._runtime.truncate_state(entry, best_len)
                 return entry, best_len
-            self._entries[best] = entry
+            with self.lock:
+                self._entries[best] = entry
             self._runtime.truncate_state(state, best_len)
             return state, best_len
 
@@ -884,23 +906,28 @@ class PrefixCache:
 
     def nbytes(self) -> int:
         """What the entries hold: room an eviction can give back."""
-        return sum(self._runtime.state_nbytes(state) for state in self._entries.values())
+        with self.lock:
+            return sum(self._runtime.state_nbytes(state) for state in self._entries.values())
 
     def store(self, tokens: list[int], state: State) -> None:
         key = _pack(tokens)
-        old = self._entries.pop(key, None)
-        if old is not None:
-            self._runtime.free_state(old)
-        self._entries[key] = state
         if self.files is not None:
+            # saved before it joins the entries: once there, a claim on
+            # another thread may evict (free) it
             self.files.save(key, state)
+        with self.lock:
+            old = self._entries.pop(key, None)
+            if old is not None:
+                self._runtime.free_state(old)
+            self._entries[key] = state
 
     def evict_lru(self) -> bool:
-        if not self._entries:
-            return False
-        _, state = self._entries.popitem(last=False)
-        self._runtime.free_state(state)
-        return True
+        with self.lock:
+            if not self._entries:
+                return False
+            _, state = self._entries.popitem(last=False)
+            self._runtime.free_state(state)
+            return True
 
     def free_all(self) -> None:
         while self.evict_lru():
@@ -1007,9 +1034,9 @@ class Engine:
         self.facts = facts
         self.services = services
         self.cache = cache
-        # set by a Batcher before it resumes its sequences: is more than one
-        # request admitted (a prefill then shares its steps; `sequence`)
-        self._sharing = False
+        # set by a Batcher before it resumes its sequences: the prefill chunk a
+        # sequence cuts next (`sequence`; CHUNK alone, smaller beside others)
+        self._chunk = CHUNK
         self.vision_on = False   # images read: asked for by the operator (Engine.vision)
         # the saved-prompt tier (a `FileCache`), when the operator asked for
         # one: a whole prompt seen before starts past its prefill
@@ -1038,7 +1065,7 @@ class Engine:
             raise ContractError(f"backend {backend!r} not in manifest: {model.backends}")
         runtime = load_runtime(footless_dir / backend / "runtime.py")
         cache = PrefixCache(runtime)
-        services = EngineServices(Ledger(budget, cache.evict_lru))
+        services = EngineServices(Ledger(budget, cache.evict_lru, cache.lock))
         cache.available = services.accounting.available
         facts = runtime.open(str(model_dir), services)
         verify(model, facts)
@@ -1431,10 +1458,8 @@ class Engine:
             at = 0                          # of `fed`, forwarded so far
             try:
                 while at < len(fed):
-                    # a prefill shares its steps with other requests' decodes in
-                    # smaller chunks: each of their tokens waits for one chunk
-                    size = SHARED_CHUNK if self._sharing else CHUNK
-                    chunk = fed[at:at + size]
+                    # the Batcher's size: smaller beside other requests
+                    chunk = fed[at:at + self._chunk]
                     last = at + len(chunk) == len(fed)
                     # a step with no sampling spec samples nothing: max_tokens = 0
                     # is exactly zero output, and chunks before the last one never
@@ -1584,6 +1609,32 @@ class _Task:
         self.order = order
 
 
+class _Flight:
+    """A prefill step running on a thread of its own, beside the decode steps
+    (`concurrent_prefill`): the runtime's step for these tasks' items; its
+    results, or its error, once `done` is set."""
+
+    def __init__(self, engine: "Engine", tasks: list[_Task]) -> None:
+        self.tasks = tasks
+        self.done = threading.Event()
+        self.results = None
+        self.error: BaseException | None = None
+        self.elapsed = 0.0
+        items = [t.want.item for t in tasks]
+        threading.Thread(target=self._run, args=(engine.runtime, items),
+                         name="footless-prefill", daemon=True).start()
+
+    def _run(self, runtime, items) -> None:
+        try:
+            started = time.perf_counter()
+            self.results = runtime.step(items, StepContext())
+            self.elapsed = time.perf_counter() - started
+        except BaseException as exc:  # noqa: BLE001 - handed to the tasks when it lands
+            self.error = exc
+        finally:
+            self.done.set()
+
+
 class Batcher:
     """Several requests' steps as one: the engine's scheduling policy.
 
@@ -1593,20 +1644,25 @@ class Batcher:
     others -- while the budget has room for what they ask (`Admit`: the ledger's
     free bytes and what the prefix cache could give back). Each `step` runs ONE
     runtime step over the admitted tasks: every decode, and at most one prefill
-    chunk (the oldest request's). A task waiting on work outside the model
-    (`Wait`: a saved state loading) is admitted but out of the ready and
-    stepping sets until its wait is over; a step with nothing else to do
-    blocks briefly on one waiting ticket instead of spinning. A task cancelled
-    at a step boundary is ended there without the model. A step the budget
-    refuses runs again without its youngest task, which is preempted and
-    admitted again later; alone, a refusal is the task's error, as it always
-    was.
+    chunk (the oldest request's). A package that declares `concurrent_prefill`
+    runs that chunk on a thread of its own instead (`_Flight`) while the
+    decode steps go on: one prefill step in flight at a time, the decodes
+    never waiting for it. A task waiting on work outside the model (`Wait`: a
+    saved state loading) is admitted but out of the ready and stepping sets
+    until its wait is over; a step with nothing else to do blocks briefly on
+    one waiting ticket or the prefill in flight instead of spinning. A task
+    cancelled at a step boundary is ended there without the model. A step the
+    budget refuses runs again without its youngest task, which is preempted
+    and admitted again later; alone, a refusal is the task's error, as it
+    always was.
     """
 
     def __init__(self, engine: "Engine") -> None:
         self.engine = engine
         self.tasks: list[_Task] = []
         self._order = 0
+        self._overlap = CONCURRENT_PREFILL in engine.facts.capabilities
+        self._flight: _Flight | None = None
 
     def add(self, gen) -> _Task:
         task = _Task(gen, self._order)
@@ -1648,6 +1704,35 @@ class Batcher:
     def _room(self) -> int:
         return self.engine.services.accounting.available() + self.engine.cache.nbytes()
 
+    def _chunk(self, live: list[_Task]) -> int:
+        """The prefill chunk a sequence cuts next: CHUNK alone; beside
+        others SHARED_CHUNK -- or, when the package runs prefill beside the
+        decodes, OVERLAP_CHUNK unless another request waits to prefill."""
+        if len(live) <= 1:
+            return CHUNK
+        if not self._overlap:
+            return SHARED_CHUNK
+        prefilling = sum(1 for t in live if isinstance(t.want, Want) and t.want.item.input_tokens)
+        waiting = any(not t.admitted and not t.done for t in self.tasks)
+        return SHARED_CHUNK if prefilling > 1 or waiting else OVERLAP_CHUNK
+
+    def _land(self, flight: _Flight) -> None:
+        """The prefill step in flight is done: its tasks go on, or take its
+        error (a refused claim beside other tasks preempts them instead)."""
+        self._flight = None
+        if flight.error is None:
+            for task, result in zip(flight.tasks, flight.results):
+                self._advance(task, (result, flight.elapsed))
+            return
+        others = [t for t in self.tasks if t.admitted and not t.done and t not in flight.tasks]
+        for task in flight.tasks:
+            if isinstance(flight.error, BudgetRefused) and others:
+                self._advance(task, throw=Preempted())
+                self.engine.services.log("info", "budget refused a prefill step: "
+                                                 "that request waits for room")
+            else:
+                self._advance(task, throw=flight.error)
+
     def step(self) -> list[_Task]:
         """Admit what fits, run one step, and return the tasks that ended."""
         engine = self.engine
@@ -1660,9 +1745,11 @@ class Batcher:
                 break                   # arrival order: nobody overtakes the head
             task.admitted = True
             live.append(task)
-            engine._sharing = len(live) > 1
+            engine._chunk = self._chunk(live)
             self._advance(task)
-        engine._sharing = len(live) > 1
+        engine._chunk = self._chunk(live)
+        if self._flight is not None and self._flight.done.is_set():
+            self._land(self._flight)
         for task in live:
             # a wait that is over: resume the sequence here, so its want is
             # settled before the ready set is taken (a still-waiting task
@@ -1670,7 +1757,8 @@ class Batcher:
             if not task.done and isinstance(task.want, Wait) \
                     and task.want.ticket.ready():
                 self._advance(task)
-        ready = [t for t in live if not t.done and isinstance(t.want, Want)]
+        flying = self._flight.tasks if self._flight is not None else []
+        ready = [t for t in live if not t.done and isinstance(t.want, Want) and t not in flying]
         stepping = []
         for task in ready:
             if task.want.ctx.cancelled():
@@ -1680,22 +1768,33 @@ class Batcher:
                 stepping.append(task)
         decodes = [t for t in stepping if not t.want.item.input_tokens]
         prefills = [t for t in stepping if t.want.item.input_tokens]
-        batch = decodes + prefills[:1]
+        if self._overlap:
+            if prefills and self._flight is None:
+                self._flight = _Flight(engine, prefills[:1])
+            batch = decodes
+        else:
+            batch = decodes + prefills[:1]
         if not batch:
-            for task in live:
-                if isinstance(task.want, Wait):
-                    # nothing to step and work in flight: block briefly on
-                    # one ticket rather than spin -- a request arriving
-                    # during the wait is never held longer than this
-                    task.want.ticket.wait(0.05)
-                    break
+            if self._flight is not None:
+                # nothing to step beside it: wait for the prefill in flight
+                # (briefly -- a request arriving meanwhile is admitted then)
+                if self._flight.done.wait(0.05):
+                    self._land(self._flight)
+            else:
+                for task in live:
+                    if isinstance(task.want, Wait):
+                        # nothing to step and work in flight: block briefly on
+                        # one ticket rather than spin -- a request arriving
+                        # during the wait is never held longer than this
+                        task.want.ticket.wait(0.05)
+                        break
         while batch:
             try:
                 started = time.perf_counter()
                 results = engine.runtime.step([t.want.item for t in batch], StepContext())
                 elapsed = time.perf_counter() - started
             except BudgetRefused as exc:
-                if len(batch) == 1:
+                if len(batch) == 1 and self._flight is None:
                     self._advance(batch[0], throw=exc)
                     break
                 victim = max(batch, key=lambda t: t.order)

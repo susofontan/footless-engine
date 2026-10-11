@@ -87,6 +87,7 @@ its verb as a contract error.
 | `tool_calls` | `tool_calls(text, tools, final)` | reads the calls the template's format writes, and may list the one still being written as `partial` |
 | `vision` | `set_vision(enabled)`, `chat_images(messages, ...)` | places each image's tokens in the prompt; a step reads the images its spans name (a span may begin in an earlier step); a state keeps its images (truncate, clone, export) |
 | `logprobs` | (on `StepResult.top_logprobs`) | the top log-probabilities of each sampled step |
+| `concurrent_prefill` | (none: a promise about `step`) | a prefill step may run on one thread while decode steps run on another (other states, other verbs meanwhile); every result as alone |
 
 A step that hands out a token computed earlier (a verified draft) sets
 `StepResult.forwarded = False`, so the engine does not book it as a forward.

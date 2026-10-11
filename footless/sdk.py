@@ -265,3 +265,13 @@ TOOL_CALLS = "tool_calls"
 # placeholders; their count is the model's business), in order. `level=` and
 # `tools=` reach it as they reach `chat`.
 VISION = "vision"
+
+
+# The one spelling of the `concurrent_prefill` capability: no verb, a promise
+# about `step`. The engine may run a step whose items all feed input tokens (a
+# prefill step) on one thread while steps whose items feed none (decode steps)
+# run on another -- at most those two at once, never sharing a state -- and
+# call the state verbs (`clone_state`, `truncate_state`, `free_state`, ...) on
+# other states meanwhile; `accounting` and `log` may be called from either
+# thread. Each step's results are the ones it gets alone.
+CONCURRENT_PREFILL = "concurrent_prefill"

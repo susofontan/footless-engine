@@ -143,6 +143,9 @@ gates, and correctness gates come before speed. Then:
 - A stream carries a tool call as vLLM's does (id and name, then the
   arguments as they grow); `tool_calls` may list the call still being written
   as `partial`, its arguments a prefix of the complete call's (2026-10-07).
+- Behind `concurrent_prefill` (a promise about `step`, no verb) the Batcher
+  runs one prefill step at a time on a thread of its own while decode steps go
+  on; the ledger and the prefix cache take one lock (2026-10-11).
 
 ## Not yet decided
 

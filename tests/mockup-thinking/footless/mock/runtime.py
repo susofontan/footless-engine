@@ -13,6 +13,10 @@ on an open marker, so generation begins inside a block (`thinking hard`), and
 with thinking off it ends on a closed, empty one, so the answer starts outside
 it. The script is chosen from the prompt, not from a remembered call — a raw
 completion with no template behind it starts outside a block too.
+
+It also declares `concurrent_prefill`: its steps touch only their own states
+and the engine's (thread-safe) accounting, so a prefill step may run on one
+thread while decode steps run on another.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ import random
 
 from footless.sdk import (
     BudgetRefused,
+    CONCURRENT_PREFILL,
     ContractError,
     LABEL_LOGPROBS,
     Claim,
@@ -79,7 +84,7 @@ class MockThinkingRuntime:
             cache_bytes_per_token=BPT,
             max_batch=MAX_BATCH,
             max_context=256,
-            capabilities=["logprobs", LABEL_LOGPROBS],
+            capabilities=["logprobs", LABEL_LOGPROBS, CONCURRENT_PREFILL],
             stop_tokens=[EOS],
             thinking_markers=[OPEN, CLOSE],
             thinking_open_at_start=True,
