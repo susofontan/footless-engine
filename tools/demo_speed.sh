@@ -398,7 +398,9 @@ try:
         head = tag("job") + "You are a careful assistant working through a project's field notes. " \
             "Answer the task, then wait for tool results and continue.\n\nFIELD NOTES\n" + long_text(3000, rng)
         agents = [{"turn": 0, "phase": "waiting", "tokens": 0, "first": None, "gen_t": 0.0, "gen_n": 0,
-                   "ttfts": [], "cached": [], "prompt": [], "err": None, "end": None}
+                   "ttfts": [], "cached": [], "prompt": [], "err": None, "end": None, "last": None,
+                   # answering time and tokens with no other prompt being read, and beside one
+                   "alone": [0.0, 0], "beside": [0.0, 0]}
                   for _ in range(args.agents)]
         doc = {"phase": "waiting", "ttft": None, "n": 0, "err": None, "end": None}
         lock = threading.Lock()
@@ -411,9 +413,17 @@ try:
             try:
                 for t in range(args.turns):
                     with lock:
-                        a["turn"], a["phase"], a["tokens"] = t + 1, "reading", 0
+                        a["turn"], a["phase"], a["tokens"], a["last"] = t + 1, "reading", 0, None
                     def piece(p):
+                        now = time.perf_counter()
                         with lock:
+                            if a["last"] is not None:
+                                reading = doc["phase"] == "reading" or \
+                                    any(o is not a and o["phase"] == "reading" for o in agents)
+                                b = a["beside" if reading else "alone"]
+                                b[0] += now - a["last"]
+                                b[1] += 1
+                            a["last"] = now
                             a["phase"] = "answering"
                             a["tokens"] += 1
                     r = chat(msgs, args.agent_tokens, piece)
@@ -487,7 +497,11 @@ try:
         R["job"] = dict(wall=wall, gen=gen, first=sum(firsts) / len(firsts),
                         later=sum(later) / len(later) if later else None,
                         hit=sum(hits) / len(hits) if hits else None, doc=doc["ttft"], doc_n=doc["n"],
-                        each=[a["gen_n"] / a["gen_t"] for a in agents if a["gen_t"]])
+                        each=[a["gen_n"] / a["gen_t"] for a in agents if a["gen_t"]],
+                        alone=[a["alone"][1] / a["alone"][0] for a in agents if a["alone"][0]],
+                        beside=[a["beside"][1] / a["beside"][0] for a in agents if a["beside"][0]],
+                        share=sum(a["beside"][0] for a in agents) /
+                        max(sum(a["alone"][0] + a["beside"][0] for a in agents), 1e-9))
 
     # ------------------------------------------------------------ ⑤ decisions
     if "decisions" not in SKIP:
@@ -608,6 +622,11 @@ try:
         out(f"    {GREY}done in{RESET} {YELLOW}{j['wall']:.1f} s{RESET}   {GREY}generated{RESET} {WHITE}{j['gen']}{RESET} "
             f"{GREY}tokens ·{RESET} {BOLD}{MAG}{j['gen'] / j['wall']:.1f} tok/s{RESET} {GREY}in all · each agent "
             f"{min(j['each']):.1f}-{max(j['each']):.1f} tok/s while answering{RESET}")
+        def span(v):
+            return f"{min(v):.1f}-{max(v):.1f} tok/s" if v else "—"
+        out(f"    {GREY}an agent answering: with no prompt being read{RESET} {YELLOW}{span(j['alone'])}{RESET}"
+            f"{GREY}, beside one being read{RESET} {YELLOW}{span(j['beside'])}{RESET} "
+            f"{GREY}({j['share']:.0%} of the answering time){RESET}")
         later = f"{j['later']:.2f} s" if j["later"] is not None else "—"
         hit = f"{j['hit']:.0%}" if j["hit"] is not None else "—"
         out(f"    {GREY}first token: first turn{RESET} {YELLOW}{j['first']:.2f} s{RESET}{GREY}, later turns{RESET} "
