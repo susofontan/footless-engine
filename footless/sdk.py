@@ -275,3 +275,11 @@ VISION = "vision"
 # other states meanwhile; `accounting` and `log` may be called from either
 # thread. Each step's results are the ones it gets alone.
 CONCURRENT_PREFILL = "concurrent_prefill"
+
+# The one spelling of the `concurrent_decode` capability: no verb, a promise
+# about `step`. The engine may run two decode steps (items feeding no input
+# tokens) on two threads at once, never sharing a state -- beside a prefill
+# step too, with `concurrent_prefill` -- so each group of sequences goes at
+# its own pace (a verified draft no longer waits for the other group's step).
+# Each step's results are the ones it gets alone.
+CONCURRENT_DECODE = "concurrent_decode"

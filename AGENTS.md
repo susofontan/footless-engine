@@ -156,6 +156,11 @@ gates, and correctness gates come before speed. Then:
   on; the ledger and the prefix cache take one lock (2026-10-11).
 - `export_state` may return a `bytearray`: a large state's blob is built in
   place, never copied again (2026-10-11).
+- Behind `concurrent_decode` (a promise about `step`, no verb) the Batcher
+  steps an even number of decoding requests as two groups on threads of their
+  own, each at its own pace, while no prefill is in flight: two sessions with
+  drafting 103 -> 111 tok/s in all, four sampled 127 -> 134, the same tokens
+  (2026-10-12).
 
 ## Not yet decided
 

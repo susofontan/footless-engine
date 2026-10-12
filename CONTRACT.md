@@ -36,10 +36,11 @@ model), the **services** (model → engine).
 The capabilities defined so far are `logprobs` (top log-probabilities on step
 results), `speculative` (the package offers a drafter), `label_logprobs`
 (next-token label scoring at the answer position), `tool_calls` (function
-tools rendered by `chat` and read back), `vision` (the package reads images)
-and `concurrent_prefill` (a prefill step may run beside decode steps); the
-middle four are reached through the optional verbs below, the last is a
-promise about `step` (see `step` below).
+tools rendered by `chat` and read back), `vision` (the package reads images),
+`concurrent_prefill` (a prefill step may run beside decode steps) and
+`concurrent_decode` (two decode steps may run at once); the middle four are
+reached through the optional verbs below, the last two are promises about
+`step` (see `step` below).
 
 ## Runtime — engine → model
 
@@ -154,6 +155,12 @@ engine reaches them only behind a declared capability. Today there are six:
   it may call the state verbs on other states, and `accounting` and `log` may
   be called from either thread. Each step's results are the ones it would get
   alone. Without the capability the engine calls the runtime from one thread.
+- With `concurrent_decode` declared, the engine may run two decode steps on
+  two threads at once (and, with `concurrent_prefill`, a prefill step on a
+  third), never sharing a state, each returning after the device is done
+  with it; the rest is as for `concurrent_prefill`. Each step's results are
+  the ones it would get alone, so each group of sequences goes at its own
+  pace.
 - `chat` renders a conversation with the package's own template and encodes
   the result. A message is a dict with `role` and `content`; any other keys
   reach the template unchanged. `thinking` selects the template's thinking

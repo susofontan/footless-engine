@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .manifest import Manifest, read as read_manifest, verify, verify_backends
 from .sdk import (
+    CONCURRENT_DECODE,
     CONCURRENT_PREFILL,
     LABEL_LOGPROBS,
     TOOL_CALLS,
@@ -1821,19 +1822,23 @@ class _Task:
 
 
 class _Flight:
-    """A prefill step running on a thread of its own, beside the decode steps
-    (`concurrent_prefill`): the runtime's step for these tasks' items; its
-    results, or its error, once `done` is set."""
+    """A step running on a thread of its own: a prefill step beside the
+    decode steps (`concurrent_prefill`), or a group of decode steps beside
+    another (`concurrent_decode`): the runtime's step for these tasks' items;
+    its results, or its error, once `done` is set (and `wake`, the
+    Batcher's, with it)."""
 
-    def __init__(self, engine: "Engine", tasks: list[_Task]) -> None:
+    def __init__(self, engine: "Engine", tasks: list[_Task], name: str = "footless-prefill",
+                 wake: threading.Event | None = None) -> None:
         self.tasks = tasks
         self.done = threading.Event()
+        self.wake = wake
         self.results = None
         self.error: BaseException | None = None
         self.elapsed = 0.0
         items = [t.want.item for t in tasks]
         threading.Thread(target=self._run, args=(engine.runtime, items),
-                         name="footless-prefill", daemon=True).start()
+                         name=name, daemon=True).start()
 
     def _run(self, runtime, items) -> None:
         try:
@@ -1844,6 +1849,8 @@ class _Flight:
             self.error = exc
         finally:
             self.done.set()
+            if self.wake is not None:
+                self.wake.set()
 
 
 class Batcher:
@@ -1860,7 +1867,12 @@ class Batcher:
     prompts (PACK_TOKENS) that fit beside it whole. A package that declares `concurrent_prefill`
     runs that chunk on a thread of its own instead (`_Flight`) while the
     decode steps go on: one prefill step in flight at a time, the decodes
-    never waiting for it. A task waiting on work outside the model (`Wait`: a
+    never waiting for it. A package that declares `concurrent_decode` has
+    an even number of decoding requests, while no prefill is in flight,
+    stepped as two groups on threads of their own (`_Flight`s too), each launched again
+    as soon as its step lands: a group goes at its own pace (a verified
+    draft does not wait for the other group's verify); with a prefill in
+    flight the decodes step together again. A task waiting on work outside the model (`Wait`: a
     saved state loading) is admitted but out of the ready and stepping sets
     until its wait is over; a step with nothing else to do blocks briefly on
     one waiting ticket or the prefill in flight instead of spinning. A task
@@ -1876,6 +1888,14 @@ class Batcher:
         self._order = 0
         self._overlap = CONCURRENT_PREFILL in engine.facts.capabilities
         self._flight: _Flight | None = None
+        self._groups = CONCURRENT_DECODE in engine.facts.capabilities
+        self._decoding: list[_Flight] = []   # decode groups in flight (concurrent_decode)
+        self._wake = threading.Event()       # set as any flight lands
+        # the live tasks when a group's step was refused: while they are the
+        # ones live, decodes step together (a refusal there yields the
+        # youngest of all, as it always did; two groups each yielding their
+        # own youngest took turns preempting each other)
+        self._refused: frozenset = frozenset()
 
     def add(self, gen) -> _Task:
         task = _Task(gen, self._order)
@@ -1971,9 +1991,25 @@ class Batcher:
             else:
                 self._advance(task, throw=flight.error)
 
+    def _land_group(self, flight: _Flight) -> None:
+        """A decode group's step is done: its tasks go on, or take its error
+        -- a refused claim moves nothing (the step is run again, together
+        with the other decodes, until the live tasks change)."""
+        self._decoding.remove(flight)
+        if flight.error is None:
+            for task, result in zip(flight.tasks, flight.results):
+                self._advance(task, (result, flight.elapsed))
+            return
+        if isinstance(flight.error, BudgetRefused):
+            self._refused = frozenset(id(t) for t in self.tasks if t.admitted and not t.done)
+            return
+        for task in flight.tasks:
+            self._advance(task, throw=flight.error)
+
     def step(self) -> list[_Task]:
         """Admit what fits, run one step, and return the tasks that ended."""
         engine = self.engine
+        self._wake.clear()
         live = [t for t in self.tasks if t.admitted and not t.done]
         for task in self.tasks:
             if task.done or task.admitted or not isinstance(task.want, Admit):
@@ -1988,6 +2024,8 @@ class Batcher:
         engine._chunk = self._chunk(live)
         if self._flight is not None and self._flight.done.is_set():
             self._land(self._flight)
+        for flight in [f for f in self._decoding if f.done.is_set()]:
+            self._land_group(flight)
         for task in live:
             # a wait that is over: resume the sequence here, so its want is
             # settled before the ready set is taken (a still-waiting task
@@ -1995,7 +2033,8 @@ class Batcher:
             if not task.done and isinstance(task.want, Wait) \
                     and task.want.ticket.ready():
                 self._advance(task)
-        flying = self._flight.tasks if self._flight is not None else []
+        flying = (self._flight.tasks if self._flight is not None else []) + \
+            [t for f in self._decoding for t in f.tasks]
         ready = [t for t in live if not t.done and isinstance(t.want, Want) and t not in flying]
         stepping = []
         for task in ready:
@@ -2008,16 +2047,40 @@ class Batcher:
         prefills = [t for t in stepping if t.want.item.input_tokens]
         if self._overlap:
             if prefills and self._flight is None:
-                self._flight = _Flight(engine, self._next_prefill(prefills))
+                self._flight = _Flight(engine, self._next_prefill(prefills), wake=self._wake)
             batch = decodes
         else:
             batch = decodes + self._next_prefill(prefills)
+        # an even count splits evenly: with three, one lane's two rows step
+        # together while the other's one verifies its drafts, and the pair
+        # holds the single back (measured 1-3 % slower than together)
+        decoding = len(decodes) + sum(len(f.tasks) for f in self._decoding)
+        grouping = self._groups and self._flight is None and not prefills and \
+            decoding >= 2 and decoding % 2 == 0 and \
+            frozenset(id(t) for t in live if not t.done) != self._refused
+        if grouping and decodes:
+            # two groups at their own pace: the ready ones fill the free slots
+            slots = 2 - len(self._decoding)
+            if slots > 0:
+                decodes.sort(key=lambda t: t.order)
+                n = min(slots, len(decodes))
+                for g in range(n):
+                    self._decoding.append(_Flight(engine, decodes[g::n], name="footless-decode",
+                                                  wake=self._wake))
+            batch = []
+        if self._decoding and batch:
+            # groups still in flight land first: at most two decode steps at
+            # once, and no prefill beside them unless the package runs one so
+            batch = []
         if not batch:
-            if self._flight is not None:
-                # nothing to step beside it: wait for the prefill in flight
+            if self._flight is not None or self._decoding:
+                # nothing to step beside them: wait for a flight to land
                 # (briefly -- a request arriving meanwhile is admitted then)
-                if self._flight.done.wait(0.05):
-                    self._land(self._flight)
+                if self._wake.wait(0.05):
+                    if self._flight is not None and self._flight.done.is_set():
+                        self._land(self._flight)
+                    for flight in [f for f in self._decoding if f.done.is_set()]:
+                        self._land_group(flight)
             else:
                 for task in live:
                     if isinstance(task.want, Wait):
@@ -2032,7 +2095,7 @@ class Batcher:
                 results = engine.runtime.step([t.want.item for t in batch], StepContext())
                 elapsed = time.perf_counter() - started
             except BudgetRefused as exc:
-                if len(batch) == 1 and self._flight is None:
+                if len(batch) == 1 and self._flight is None and not self._decoding:
                     self._advance(batch[0], throw=exc)
                     break
                 victim = max(batch, key=lambda t: t.order)

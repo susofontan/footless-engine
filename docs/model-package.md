@@ -88,6 +88,7 @@ its verb as a contract error.
 | `vision` | `set_vision(enabled)`, `chat_images(messages, ...)` | places each image's tokens in the prompt; a step reads the images its spans name (a span may begin in an earlier step); a state keeps its images (truncate, clone, export) |
 | `logprobs` | (on `StepResult.top_logprobs`) | the top log-probabilities of each sampled step |
 | `concurrent_prefill` | (none: a promise about `step`) | a prefill step may run on one thread while decode steps run on another (other states, other verbs meanwhile); every result as alone |
+| `concurrent_decode` | (none: a promise about `step`) | two decode steps may run at once on two threads (and a prefill step beside them with `concurrent_prefill`); every result as alone |
 
 A step that hands out a token computed earlier (a verified draft) sets
 `StepResult.forwarded = False`, so the engine does not book it as a forward.

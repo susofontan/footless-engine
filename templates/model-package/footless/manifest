@@ -7,7 +7,7 @@ backends = ["example"]            # hardware folders present; must match the dis
 max_batch = 1                     # items one step may carry; raise it once batched rows are exact
 max_context = 4096                # most tokens one request may carry
 cache_bytes_per_token = 0         # the cache's growing cost per token (e.g. KV bytes, all layers)
-capabilities = []                 # "speculative", "label_logprobs", "tool_calls", "logprobs", "vision", "concurrent_prefill"
+capabilities = []                 # "speculative", "label_logprobs", "tool_calls", "logprobs", "vision", "concurrent_prefill", "concurrent_decode"
 # thinking_levels = ["high", "low"]   # only if the chat template offers named levels
 
 # Optional: the package's own settings, read by its runtime after load. The

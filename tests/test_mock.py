@@ -839,6 +839,110 @@ class BatcherTest(unittest.TestCase):
         self.assertEqual(second.result.text, self.SCRIPT_TEXT)
         self.assertTrue(any("budget refused" in m for m in logs), logs)
 
+    def grouped(self, decode_seconds: float, prefill_seconds: float = 0.0):
+        """The mock as a package that declares concurrent_decode (and
+        concurrent_prefill), its steps taking a while: each step's kind,
+        thread, and how many decode steps ran at that moment (itself
+        included), and whether a prefill was running."""
+        import threading
+        caps = self.engine.facts.capabilities
+        caps.extend(c for c in ("concurrent_prefill", "concurrent_decode") if c not in caps)
+        log, decoding, prefilling = [], [], []
+        lock = threading.Lock()
+        step = self.rt.step
+
+        def slow(batch, ctx):
+            prefill = any(item.input_tokens for item in batch)
+            mine = prefilling if prefill else decoding
+            with lock:
+                mine.append(1)
+                log.append((prefill, threading.current_thread().name, len(decoding), bool(prefilling)))
+            try:
+                time.sleep(prefill_seconds if prefill else decode_seconds)
+                return step(batch, ctx)
+            finally:
+                with lock:
+                    mine.pop()
+
+        self.rt.step = slow
+        return log
+
+    def test_with_concurrent_decode_two_groups_go_at_their_own_pace(self):
+        """A package that declares concurrent_decode: requests decoding
+        together are stepped as two groups on threads of their own, at most
+        two decode steps at once; every answer is the one it gets alone."""
+        texts = ("one", "two two", "three", "four four")
+        alone = [self.engine.generate(t, 64).text for t in texts]
+        log = self.grouped(0.003)
+        batcher = Batcher(self.engine)
+        tasks = [batcher.add(self.seq(t)) for t in texts]
+        self.drain(batcher)
+        self.assertEqual([t.result.text for t in tasks], alone)
+        decode_steps = [e for e in log if not e[0]]
+        self.assertTrue(any(e[1] == "footless-decode" and e[2] == 2 for e in decode_steps),
+                        "no two decode groups ran at once")
+        self.assertLessEqual(max(e[2] for e in decode_steps), 2, "more than two decode steps at once")
+
+    def test_with_concurrent_decode_a_prefill_brings_the_groups_together(self):
+        """While a prompt is read (a prefill in flight) the decoding requests
+        step together on the Batcher's thread, not as groups; the answers
+        are the ones they get alone."""
+        self.patch("OVERLAP_CHUNK", 16)
+        self.patch("SHARED_CHUNK", 16)
+        log = self.grouped(0.002, prefill_seconds=0.02)
+        batcher = Batcher(self.engine)
+        first = [batcher.add(self.seq(t)) for t in ("one", "two two")]
+        for _ in range(6):
+            batcher.step()
+        late = batcher.add(self.seq("z" * 120))
+        self.drain(batcher)
+        for task in first + [late]:
+            self.assertEqual(task.result.text, self.SCRIPT_TEXT)
+        launched_beside = [e for e in log if not e[0] and e[1] == "footless-decode" and e[3]]
+        # a group already flying when the prefill started may finish its step
+        self.assertLessEqual(len(launched_beside), 2, "decode groups were launched beside a prefill")
+        self.assertTrue(any(not e[0] and e[1] != "footless-decode" and e[3] for e in log),
+                        "the decodes did not step together beside the prefill")
+
+    def test_with_concurrent_decode_a_refused_group_moves_nothing(self):
+        """A decode group's step the budget refuses moves nothing: the decodes
+        step together again (the youngest of all yields, as without groups)
+        until the live requests change -- no two groups preempting each
+        other in turn. The answers are the ones the same requests get
+        without groups."""
+        import threading
+        self.patch("ADMIT_HEADROOM", 0)
+
+        def run(caps):
+            engine = Engine.open(MODEL, budget=8 * 123)
+            self.addCleanup(engine.close)
+            engine.facts.capabilities.extend(caps)
+            engine.services.log = lambda level, message: None
+            refused, step = [], engine.runtime.step
+
+            def recording(batch, ctx):
+                try:
+                    return step(batch, ctx)
+                except BudgetRefused:
+                    refused.append(threading.current_thread().name)
+                    raise
+            engine.runtime.step = recording
+            batcher = Batcher(engine)
+            tasks = [batcher.add(engine.sequence(engine.runtime.encode(c * 24), 64)) for c in "xywv"]
+            for _ in range(2000):
+                if not batcher.busy():
+                    break
+                batcher.step()
+            for task in tasks:
+                self.assertIsNone(task.error)
+            return [t.result.text for t in tasks], refused
+
+        want, _ = run(["concurrent_prefill"])
+        got, refused = run(["concurrent_prefill", "concurrent_decode"])
+        self.assertIn("footless-decode", refused, "no group's step was refused: the test has no teeth")
+        self.assertLess(len(refused), 10)
+        self.assertEqual(got, want)
+
     def test_a_short_prompt_is_not_held_behind_a_long_one(self):
         """Prefill goes to the request with the fewest prompt tokens left: a
         short prompt arriving while a long one is read is read first and

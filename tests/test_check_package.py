@@ -41,6 +41,8 @@ class CheckPackageTest(unittest.TestCase):
         self.assertRegex(report, r"SKIP\s+vision\s+not declared")
         self.assertRegex(report, r"PASS\s+concurrent_prefill")
         self.assertRegex(tools, r"SKIP\s+concurrent_prefill\s+not declared")
+        self.assertRegex(report, r"PASS\s+concurrent_decode")
+        self.assertRegex(tools, r"SKIP\s+concurrent_decode\s+not declared")
 
     def test_a_package_that_breaks_a_rule_fails(self):
         """A mock whose clone forgets the state is caught: the check has teeth."""

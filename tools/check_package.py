@@ -20,7 +20,9 @@ already compares the manifest with the runtime's facts (rule 3). What follows:
   capabilities       label_logprobs, tool_calls and speculative, when declared
                      (speculation must not change one token); concurrent_prefill:
                      a prefill step on another thread while a state decodes
-                     changes no token of either
+                     changes no token of either; concurrent_decode: two threads
+                     decoding at once (one state, and a batch of two) change no
+                     token, with speculation on when declared
   accounting         everything freed, the ledger is back to zero
   vision             when declared (last: turning it on may keep a claim):
                      chat_images' tokens and spans, greedy determinism with an
@@ -44,7 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from footless.engine import DEFAULT_BUDGET, Engine, StepContext  # noqa: E402
 from footless.sdk import (  # noqa: E402
-    CONCURRENT_PREFILL, LABEL_LOGPROBS, TOOL_CALLS, VISION, Image, ImageSpan, BudgetRefused, ContractError, SamplingSpec, StepItem,
+    CONCURRENT_DECODE, CONCURRENT_PREFILL, LABEL_LOGPROBS, TOOL_CALLS, VISION, Image, ImageSpan, BudgetRefused, ContractError, SamplingSpec, StepItem,
 )
 
 GREEDY = SamplingSpec(temperature=0.0, top_k=1, top_p=1.0, seed=1)
@@ -353,6 +355,41 @@ class Checker:
         assert got_b == alone[1], "decode steps beside a prefill answer differently"
         return f"{beside} decode steps beside the prefill"
 
+    def concurrent_decode(self):
+        if CONCURRENT_DECODE not in self.engine.facts.capabilities:
+            raise Skip("not declared")
+        if "speculative" in self.engine.facts.capabilities:
+            self.engine.speculative(True)        # each thread verifies its own drafts
+        prompts = self._prompts(3)
+        alone = [self.run_from(p) for p in prompts]
+        sts = [self.state() for _ in prompts]
+        got = [[self.feed(st, p).token] for st, p in zip(sts, prompts)]
+        pair = self.engine.facts.max_batch >= 2
+        groups = [[0], [1, 2]] if pair else [[0], [1]]
+        failed = []
+
+        def decode(group):
+            try:
+                for _ in range(self.n):
+                    res = self.rt.step([StepItem(sts[k], [], GREEDY) for k in group], self.ctx)
+                    for k, r in zip(group, res):
+                        got[k].append(r.token)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                failed.append(exc)
+        workers = [threading.Thread(target=decode, args=(g,)) for g in groups]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+        if not pair:
+            got[2] += self.decode(sts[2], self.n)
+        for st in sts:
+            self.free(st)
+        if failed:
+            raise failed[0]
+        assert got == alone, "two decode steps at once answer differently"
+        return "a state, and a batch of two, on two threads" if pair else "two states on two threads"
+
     def vision(self):
         if VISION not in self.engine.facts.capabilities:
             raise Skip("not declared")
@@ -452,6 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         c.check("tool_calls", c.tool_calls)
         c.check("speculative", c.speculative)
         c.check("concurrent_prefill", c.concurrent_prefill)
+        c.check("concurrent_decode", c.concurrent_decode)
         c.check("accounting back to zero", c.accounting)
         c.check("vision", c.vision)
     finally:
