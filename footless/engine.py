@@ -73,14 +73,16 @@ DEFAULT_MAX_TOKENS = 16384
 # and its growth. Alone, a request is always admitted.
 ADMIT_HEADROOM = 8192
 # Saved states in flight, bounded by BYTES and not by job count: one blob can
-# be gigabytes. A save whose state, or whose runtime's export transient (the
-# export copies the state into its blob), cannot fit the memory left is not
-# saved: a cache never risks the machine it is speeding up. The queue's cap
-# is what waits in RAM to be written; the transient check is what a save may
-# briefly need beside its state.
+# be gigabytes. A save claims its blob's room from the states' budget while
+# the blob lives (export to write) -- evicting cached states as any claim
+# does, within the budget memory pressure leaves the cache: a save that
+# cannot get it is not made, a cache never risks the machine it is speeding
+# up. (It used to need that room FREE: with the RAM cache full, as it is
+# after a while, nearly nothing reached the disk.) The queue's cap is what
+# waits in RAM to be written.
 SAVE_QUEUE_BYTES = 2 << 30
 SAVE_QUEUE_MAX = 8  # queued saves kept; over that the oldest queued is dropped
-SAVE_TRANSIENT = 3  # a save's peak, in multiples of the state's own bytes
+SAVE_TRANSIENT = 1  # a save's blob, in multiples of the state's own bytes
 
 # The repetition guard: how long a repeating tail may run before it is a loop.
 # A model that collapses repeats one span of tokens verbatim until the budget
@@ -269,7 +271,10 @@ class Ledger:
         # cache's lock, since a claim may evict one of its entries
         self._lock = lock if lock is not None else threading.RLock()
 
-    def claim(self, nbytes: int) -> Claim:
+    def claim(self, nbytes: int, cache: bool = False) -> Claim:
+        """nbytes of the budget, cached states evicted for them; a live
+        request may go past a budget memory pressure lowered, up to the
+        ceiling -- the cache's own work (`cache`: a save's blob) may not."""
         if nbytes < 0:
             raise ContractError(f"negative claim: {nbytes}")
         with self._lock:
@@ -278,9 +283,10 @@ class Ledger:
                     break
             # past a budget memory pressure lowered, with every cached state
             # gone: a live request still has its room, up to the ceiling
-            if self.used + nbytes > self.limit():
+            limit = self.budget if cache else self.limit()
+            if self.used + nbytes > limit:
                 raise BudgetRefused(
-                    f"budget {self.limit()}B cannot admit {nbytes}B "
+                    f"budget {limit}B cannot admit {nbytes}B "
                     f"({self.used}B used, nothing left to evict)"
                 )
             self.used += nbytes
@@ -506,10 +512,10 @@ class FileCache:
     `load_async` / `begin_match` return a `Ticket` the request can wait on.
     """
 
-    def __init__(self, runtime, path, max_bytes: int, log=None, available=None) -> None:
+    def __init__(self, runtime, path, max_bytes: int, log=None, accounting=None) -> None:
         self._runtime = runtime
         self._log = log or (lambda level, message: None)
-        self.available = available    # the ledger's free bytes: room for transients
+        self.accounting = accounting  # the ledger: a save's blob claims its room there
         self._path = Path(path)
         self._max_bytes = max(0, int(max_bytes))
         self._entries: "OrderedDict[tuple, tuple[str, int]]" = OrderedDict()
@@ -656,18 +662,23 @@ class FileCache:
                 self._runtime.free_state(state)
             ticket.finish(None)
             return ticket
-        # the peak of a save is the state with the export's copies of it
-        # beside it: where that would not fit, the state is not saved -- a
-        # cache never risks the machine it is speeding up
+        # a save's blob claims its room from the states' budget until it is
+        # written (cached states evicted for it, within the budget pressure
+        # leaves): where it cannot, the state is not saved -- a cache never
+        # risks the machine it is speeding up
         size = self._runtime.state_nbytes(state)
-        if self.available is not None and SAVE_TRANSIENT * size > self.available():
-            self._log("info", f"a state of {size} B is not saved: its export wants "
-                              f"{SAVE_TRANSIENT * size} B beside it and "
-                              f"{self.available()} B are free")
-            if owned:
-                self._runtime.free_state(state)
-            ticket.finish(None)
-            return ticket
+        hold = None
+        if self.accounting is not None:
+            try:
+                hold = self.accounting.claim(SAVE_TRANSIENT * size, cache=True)
+            except BudgetRefused:
+                self._log("info", f"a state of {size} B is not saved: its blob wants "
+                                  f"{SAVE_TRANSIENT * size} B and the states' budget has no "
+                                  f"room left for it")
+                if owned:
+                    self._runtime.free_state(state)
+                ticket.finish(None)
+                return ticket
         blob = None
         if not owned:
             try:
@@ -675,9 +686,10 @@ class FileCache:
                 size = len(blob)
             except Exception as exc:  # noqa: BLE001 - a cache never fails a request
                 self._log("warning", f"state not saved: {exc}")
+                self._unhold(hold)
                 ticket.finish(None)
                 return ticket
-        job = (key, blob, state, owned, ticket, size)
+        job = (key, blob, state, owned, ticket, size, hold)
         dropped = []
         with self._cond:
             closed = self._stopped
@@ -697,16 +709,23 @@ class FileCache:
         if closed:
             if owned:
                 self._runtime.free_state(state)
+            self._unhold(hold)
             ticket.finish(None)
             return ticket
-        for _, _, drop_state, drop_owned, drop_ticket, _ in dropped:
+        for _, _, drop_state, drop_owned, drop_ticket, _, drop_hold in dropped:
             self._log("info", f"save queue full ({SAVE_QUEUE_MAX} waiting or "
                               f"{SAVE_QUEUE_BYTES} B): the oldest queued state was dropped")
             if drop_owned:
                 self._runtime.free_state(drop_state)
+            self._unhold(drop_hold)
             drop_ticket.finish(None)
         self._ensure_worker()
         return ticket
+
+    def _unhold(self, hold) -> None:
+        """A save's room back to the budget (its blob written or dropped)."""
+        if hold is not None:
+            self.accounting.release(hold)
 
     def flush(self) -> None:
         """Wait for every queued save to land (or be dropped)."""
@@ -771,9 +790,10 @@ class FileCache:
         ticket.finish(raw)
 
     def _run_save(self, key: tuple, blob, state, owned: bool,
-                  ticket: Ticket, size: int) -> None:
+                  ticket: Ticket, size: int, hold) -> None:
         """One queued save: export (an owned state), make room, write. An
-        owned state is freed whatever happens."""
+        owned state is freed, and the save's room given back, whatever
+        happens."""
         try:
             if owned:
                 try:
@@ -798,6 +818,8 @@ class FileCache:
         finally:
             if owned:
                 self._runtime.free_state(state)
+            blob = None
+            self._unhold(hold)
             ticket.finish(None)
 
     def _write(self, ident: str, key, blob: bytes) -> bool:
@@ -1184,11 +1206,11 @@ class Engine:
         verify(model, facts)
         if prefix_cache is not None:
             cache.files = FileCache(runtime, *prefix_cache, log=services.log,
-                                    available=services.accounting.available)
+                                    accounting=services.accounting)
         engine = cls(model, runtime, facts, services, cache)
         if prompt_cache is not None:
             engine.prompt_cache = FileCache(runtime, *prompt_cache, log=services.log,
-                                            available=services.accounting.available)
+                                            accounting=services.accounting)
         return engine
 
     def generate(

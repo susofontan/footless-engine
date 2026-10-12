@@ -138,6 +138,10 @@ gates, and correctness gates come before speed. Then:
   states, while live requests are admitted and served against the ceiling
   (the most `set_budget` gave) -- it had refused a 110k-token conversation
   against a pressure budget of 1.7 GB (2026-10-12).
+- A disk save's blob claims its room from the states' budget until written,
+  evicting cached states, instead of needing that room free -- with the RAM
+  cache full, as it is after a while, nearly nothing reached the disk
+  (2026-10-12).
 
 - Images cross the contract behind the `vision` capability, on only when the
   operator asks (`serve --vision`): `set_vision`, `chat_images` (prompt ids and

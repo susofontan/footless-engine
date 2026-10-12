@@ -78,10 +78,11 @@ A whole-prompt hit starts past its prefill outright. The engine also saves
 what a hit was cut back to: sentinel entries at the cut points it sees, so
 a later turn starts at one instead of re-forwarding the kept tail. Saves and
 loads run beside the model — a request waits only for the state it is about
-to use — and a save whose export would not fit the memory left beside the
-state is not made: the peak of a save is the state with the export's copies
-of it, which at a long session's size is gigabytes, and a cache never risks
-the machine it is speeding up.
+to use. A save's blob — at a long session's size, gigabytes — claims its
+room from the states' budget until it is written, evicting cached states as
+any claim does (within the room memory pressure leaves the cache); a save
+that cannot get it is not made: a cache never risks the machine it is
+speeding up.
 
 ## Fields
 

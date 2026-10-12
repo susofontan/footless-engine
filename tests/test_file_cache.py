@@ -108,12 +108,13 @@ class FileCacheTest(unittest.TestCase):
         self.assertFalse(cache.has([1, 2, 3, 4, 5]))
         self.assertEqual(list(Path(self.dir.name).glob("*.state")), [])
 
-    def test_a_state_whose_export_would_not_fit_is_not_saved(self):
-        # the peak of a save is the state with the export's copies beside it:
-        # no room, and the state is not saved (here: nothing left at all)
+    def test_a_state_whose_blob_finds_no_room_is_not_saved(self):
+        # a save's blob claims its room from the budget: none (and nothing
+        # cached to evict), and the state is not saved
+        from footless.engine import Ledger
         log = []
         cache = FileCache(self.engine.runtime, self.dir.name, 1 << 30,
-                          log=lambda level, msg: log.append(msg), available=lambda: 4)
+                          log=lambda level, msg: log.append(msg), accounting=Ledger(4, lambda: False))
         self.addCleanup(cache.close)
         owned = self._state([1])
         cache.save([1], owned, owned=True)
@@ -121,6 +122,31 @@ class FileCacheTest(unittest.TestCase):
         self.assertFalse(cache.has([1]))
         self.assertIsNone(owned.claim, "an owned state is freed when it is not saved")
         self.assertTrue(any("not saved" in m for m in log))
+
+    def test_a_full_ram_cache_makes_room_for_a_save(self):
+        """The states' budget full of cached states (as it is after a while)
+        does not stop the disk tier learning: the save's blob evicts the
+        oldest cached state for its room, is written, and gives it back."""
+        from footless.engine import Ledger
+        runtime = self.engine.runtime
+        size = runtime.state_nbytes(self._state([1, 2]))
+        cached = []
+        ledger = None
+
+        def evict():
+            if not cached:
+                return False
+            ledger.release(cached.pop(0))
+            return True
+        ledger = Ledger(2 * size, evict)
+        cached += [ledger.claim(size), ledger.claim(size)]   # full: two cached states
+        cache = FileCache(runtime, self.dir.name, 1 << 30, accounting=ledger)
+        self.addCleanup(cache.close)
+        cache.save([1, 2], self._state([1, 2]))
+        cache.flush()
+        self.assertTrue(cache.has([1, 2]))
+        self.assertEqual(len(cached), 1, "the oldest cached state made the room")
+        self.assertEqual(ledger.used, size, "the save gave its room back once written")
 
     def test_image_placeholder_keys_never_match_another_image(self):
         one = [1, 2, ("a" * 64, 0), 3]
