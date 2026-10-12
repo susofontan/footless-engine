@@ -309,6 +309,10 @@ class WaitTest(unittest.TestCase):
         return head, tail
 
     def test_a_disk_hit_waits_before_the_first_want_and_still_answers(self):
+        import footless.engine as engine_module
+        saved = engine_module.HIT_MIN               # a five-token head counts as a hit here
+        engine_module.HIT_MIN = 1
+        self.addCleanup(setattr, engine_module, "HIT_MIN", saved)
         with tempfile.TemporaryDirectory() as tmp:
             head, tail = self._two_runs(tmp)
             again = Engine.open(MODEL, prefix_cache=(tmp, 1 << 20))

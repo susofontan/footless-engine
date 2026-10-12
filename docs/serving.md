@@ -75,6 +75,13 @@ The prompt cache answers whole prompts only; the prefix cache any common
 prefix, and a match saved on disk longer than memory's wins. Without the
 flags, neither exists and nothing is written.
 
+A cached state is taken only when the prefix it shares is worth its copy: at
+least 256 tokens, or half of its prompt (on disk, of its tokens) -- every chat
+prompt shares its template's first tokens with every cached conversation,
+and a long one's state is not copied, or read from the disk, to keep three
+of them. Requests arriving together on one long head read it once: the
+first to look it up becomes its reader before its own lookups (which may
+wait on the disk), and the others wait for its state at the shared point.
 A hit shorter than its entry's key is fitted by the package's
 `truncate_state`: where a state cannot be cut back cheaply, the kept tail
 re-forwards in the next step (reported as `forwarded_tokens`, CONTRACT.md).

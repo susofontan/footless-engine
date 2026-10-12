@@ -67,6 +67,20 @@ PACK_TOKENS = 128
 # that one's state at the shared point instead of reading those tokens again
 # (agents started together on one system prompt and tools).
 SHARE_MIN = 256
+# A cached state (in RAM or on disk) is taken for a prompt only when the
+# prefix they share is worth its copy: at least this many tokens, or at
+# least half of the cached state's prompt (on disk, where that is not kept,
+# of all its tokens). Every chat prompt shares its template's first tokens
+# with every cached conversation: without this a fresh prompt copied -- or
+# read from the disk and imported -- some long conversation's whole state to
+# keep three tokens of it.
+HIT_MIN = 256
+
+
+def _worth(common: int, length: int) -> bool:
+    """Is a cached state whose prompt is `length` tokens, sharing `common`
+    tokens with a prompt, worth taking for it?"""
+    return common >= HIT_MIN or 2 * common >= length
 DEFAULT_BUDGET = 1 << 34
 DEFAULT_MAX_TOKENS = 16384
 # The room a request must find to be admitted beside others (Batcher): its
@@ -596,6 +610,8 @@ class FileCache:
             common = _common(entry_key, key)
             if common <= min_len:
                 continue
+            if not _worth(common, _keylen(entry_key)):
+                continue
             clean = _keylen(entry_key) == common
             if best is None or (clean, common) > (best_clean, best_len):
                 best, best_len, best_clean = entry_key, common, clean
@@ -950,13 +966,14 @@ class PrefixCache:
         best_len = 0
         with self.lock:
             entries = list(self._entries)
+            prompts = dict(self._prompts)
         for entry in entries:
             common = _common(entry, key)
             # a partial match truncates the clone, and a truncate may queue the
             # kept ids for re-forwarding in the next step (CONTRACT.md,
             # `truncate_state`) -- invisible here, which is why the rates book
             # `StepResult.forwarded_tokens` instead of what the request fed.
-            if common > best_len:
+            if common > best_len and _worth(common, prompts.get(entry, _keylen(entry))):
                 best, best_len = entry, common
 
         def settle(files_hit):
@@ -1008,8 +1025,8 @@ class PrefixCache:
         would start with, without taking it."""
         key = _pack(tokens)
         with self.lock:
-            entries = list(self._entries)
-        best = max((_common(entry, key) for entry in entries), default=0)
+            entries = [(entry, self._prompts.get(entry, _keylen(entry))) for entry in self._entries]
+        best = max([0] + [c for entry, length in entries if _worth(c := _common(entry, key), length)])
         if self.files is not None:
             best = max(best, self.files.match_len(key))
         return best
@@ -1572,16 +1589,28 @@ class Engine:
                 if state is not None:
                     matched = len(keyed)
             source = None
+            producer = None
             if state is None and first and not generated:
                 # another request is reading this prompt's head right now:
                 # its state there, once it gets there, instead of a second read
                 share = self._share(keyed)
                 while share is not None and not share.ready():
                     yield Wait(share)
+                # this one reads its prompt from here on: a request arriving
+                # now waits for it -- registered before the lookup below,
+                # which may wait on the disk (registered after it, requests
+                # arriving together all passed the check above and each read
+                # the shared head on its own)
+                producer = _Producer(_pack(keyed), 0)
+                self._producers.append(producer)
             if state is None:
                 ticket = self.cache.begin_lookup(context)
-                while not ticket.ready():
-                    yield Wait(ticket)
+                try:
+                    while not ticket.ready():
+                        yield Wait(ticket)
+                except BaseException:
+                    self._unproduce(producer)
+                    raise
                 state, matched = ticket.result()
                 source = ticket.source
             if self.cache.files is not None and 0 < matched < len(context) \
@@ -1596,15 +1625,24 @@ class Engine:
                     kept = self.runtime.clone_state(state)
                 except BudgetRefused:
                     kept = None
+                except BaseException:
+                    self._unproduce(producer)   # those waiting for it go on
+                    raise
                 if kept is not None:
                     self.cache.files.save(context[:matched], kept, owned=True)
             fed = (list(tokens) + generated)[matched:]
             taken = len(generated)          # output this admission adds is past here
             at = 0                          # of `fed`, forwarded so far
-            producer = None
-            if first and fed:
-                producer = _Producer(_pack(keyed), matched)
-                self._producers.append(producer)
+            if producer is not None:
+                if fed:
+                    # the cache gave it `matched`: a point up to there is in
+                    # the cache already, where a waiter's own lookup finds it
+                    producer.pos = matched
+                    for cut in [c for c in producer.cuts if c <= matched]:
+                        producer.cuts.pop(cut).finish(None)
+                else:
+                    self._unproduce(producer)
+                    producer = None
             try:
                 while at < len(fed):
                     # the Batcher's size: smaller beside other requests, and

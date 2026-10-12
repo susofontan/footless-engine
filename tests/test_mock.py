@@ -62,6 +62,18 @@ class MockModelTest(unittest.TestCase):
             r2.prompt_tokens_fed, len(self.engine.runtime.encode("hello there"))
         )
 
+    def test_a_cached_state_sharing_a_few_tokens_is_not_taken(self):
+        """A cached state is taken only when the shared prefix is worth its
+        copy (HIT_MIN tokens, or half its prompt): a long prompt's state
+        sharing three first tokens is left alone, the same prompt again is a
+        whole hit."""
+        enc = self.engine.runtime.encode
+        self.engine.generate("abc" + "x" * 200, 8)
+        r = self.engine.generate("abc" + "y" * 20, 8)
+        self.assertEqual(r.prompt_tokens_fed, len(enc("abc" + "y" * 20)), "three shared tokens were taken")
+        again = self.engine.generate("abc" + "y" * 20, 8)
+        self.assertLess(again.prompt_tokens_fed, 2, "the same prompt again was not a hit")
+
     def test_a_replay_counts_as_prompt_fed(self):
         """A runtime whose truncate replays what it kept reports it in the
         first step's forwarded_tokens: those tokens were not saved."""
@@ -1021,6 +1033,39 @@ class BatcherTest(unittest.TestCase):
         self.assertEqual(a.result.prompt_tokens_fed, 110)
         self.assertEqual(b.result.prompt_tokens_fed, len("second, longer tail"))
         self.assertEqual(self.engine._producers, [])
+
+    def test_a_shared_head_is_read_once_with_disk_caches(self):
+        """With the disk caches on (a request's first lookups wait on the
+        disk), requests arriving together still read their shared head once:
+        the first to look registers as its reader before its lookups, and the
+        others wait for its state there instead of each reading the head."""
+        import tempfile
+        self.patch("SHARE_MIN", 16)
+        self.patch("CHUNK", 32)
+        self.patch("SHARED_CHUNK", 32)
+        self.patch("OVERLAP_CHUNK", 32)
+        dirs = [tempfile.TemporaryDirectory() for _ in range(2)]
+        for d in dirs:
+            self.addCleanup(d.cleanup)
+        engine = Engine.open(MODEL, prompt_cache=(dirs[0].name, 1 << 20), prefix_cache=(dirs[1].name, 1 << 20))
+        self.addCleanup(engine.close)
+        head = "h" * 100
+        # an earlier conversation on disk sharing the prompts' first tokens
+        # (as every chat prompt shares its template's): their lookups read it
+        engine.generate_tokens(engine.runtime.encode("hhhh, an earlier conversation"), 4)
+        engine.cache.files.flush()
+        engine.cache.free_all()
+        batcher = Batcher(engine)
+        tails = ("first tail", "second, longer tail", "a third")
+        tasks = [batcher.add(engine.sequence(engine.runtime.encode(head + t), 64)) for t in tails]
+        while batcher.busy():
+            batcher.step()
+        for task in tasks:
+            self.assertEqual(task.result.text, self.SCRIPT_TEXT)
+        fed = sorted(t.result.prompt_tokens_fed for t in tasks)
+        self.assertEqual(fed, sorted([len(head) + len(tails[0])] + [len(t) for t in tails[1:]]),
+                         "the head was read more than once")
+        self.assertEqual(engine._producers, [])
 
     def test_a_shared_head_cut_short_lets_the_waiting_request_go_on(self):
         """The request a second one waits for ends before the shared point

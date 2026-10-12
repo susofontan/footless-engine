@@ -161,6 +161,12 @@ gates, and correctness gates come before speed. Then:
   own, each at its own pace, while no prefill is in flight: two sessions with
   drafting 103 -> 111 tok/s in all, four sampled 127 -> 134, the same tokens
   (2026-10-12).
+- A cached state is taken for a prompt only when the shared prefix is worth
+  its copy (HIT_MIN 256 tokens, or half its prompt): a fresh prompt had read
+  long conversations' states from the disk to keep the template's first
+  tokens. A request reading a prompt is its head's producer before its own
+  lookups: with the disk caches on, requests arriving together each read
+  the shared head (2026-10-13).
 
 ## Not yet decided
 
