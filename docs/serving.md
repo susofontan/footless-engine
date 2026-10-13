@@ -29,8 +29,8 @@ others decode, so their tokens wait for one chunk at a time. A package that
 declares `concurrent_prefill` runs the prefill chunk on a thread of its own
 instead, one at a time, while the decode steps go on without waiting for it
 (chunks of 2048 beside others, 1024 when another prefill waits). One that
-declares `concurrent_decode` has an even number of decoding requests stepped
-as two groups, each on a thread of its own and at its own pace -- a request whose
+declares `concurrent_decode` has an even number of decoding requests, or five
+and more, stepped as two groups, each on a thread of its own and at its own pace -- a request whose
 drafted token was verified does not wait for the other group -- while no
 prefill runs; with a prefill in flight they step together. How the rows of
 one step are computed is the package's business; each item's result must be

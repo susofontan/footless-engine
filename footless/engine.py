@@ -1906,7 +1906,7 @@ class Batcher:
     runs that chunk on a thread of its own instead (`_Flight`) while the
     decode steps go on: one prefill step in flight at a time, the decodes
     never waiting for it. A package that declares `concurrent_decode` has
-    an even number of decoding requests, while no prefill is in flight,
+    an even number of decoding requests, or five and more, while no prefill is in flight,
     stepped as two groups on threads of their own (`_Flight`s too), each launched again
     as soon as its step lands: a group goes at its own pace (a verified
     draft does not wait for the other group's verify); with a prefill in
@@ -2089,12 +2089,13 @@ class Batcher:
             batch = decodes
         else:
             batch = decodes + self._next_prefill(prefills)
-        # an even count splits evenly: with three, one lane's two rows step
+        # two groups of the same kind: an even count, or five and more (two
+        # rows a group at least). With three, one lane's two rows step
         # together while the other's one verifies its drafts, and the pair
         # holds the single back (measured 1-3 % slower than together)
         decoding = len(decodes) + sum(len(f.tasks) for f in self._decoding)
         grouping = self._groups and self._flight is None and not prefills and \
-            decoding >= 2 and decoding % 2 == 0 and \
+            decoding >= 2 and (decoding % 2 == 0 or decoding >= 5) and \
             frozenset(id(t) for t in live if not t.done) != self._refused
         if grouping and decodes:
             # two groups at their own pace: the ready ones fill the free slots

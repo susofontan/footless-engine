@@ -895,6 +895,30 @@ class BatcherTest(unittest.TestCase):
                         "no two decode groups ran at once")
         self.assertLessEqual(max(e[2] for e in decode_steps), 2, "more than two decode steps at once")
 
+    def test_with_concurrent_decode_five_split_three_do_not(self):
+        """An odd count of five or more splits into two groups (two rows a
+        group at least); three step together (a lone row's verify would hold
+        the pair back). The answers are the ones they get alone."""
+        import dataclasses
+        mock = type(self.rt).step.__globals__          # the mock runtime's module
+        saved = mock["MAX_BATCH"], self.engine.facts
+        mock["MAX_BATCH"] = 8
+        self.engine.facts = dataclasses.replace(saved[1], max_batch=8)
+        self.addCleanup(mock.__setitem__, "MAX_BATCH", saved[0])
+        self.addCleanup(setattr, self.engine, "facts", saved[1])
+        log = self.grouped(0.003)
+        for n in (5, 3):
+            with self.subTest(requests=n):
+                del log[:]
+                texts = [f"request {'x' * k}" for k in range(n)]
+                alone = [self.engine.generate(t, 64).text for t in texts]
+                batcher = Batcher(self.engine)
+                tasks = [batcher.add(self.seq(t)) for t in texts]
+                self.drain(batcher)
+                self.assertEqual([t.result.text for t in tasks], alone)
+                grouped = any(e[1] == "footless-decode" and e[2] == 2 for e in log if not e[0])
+                self.assertEqual(grouped, n == 5)
+
     def test_with_concurrent_decode_a_prefill_brings_the_groups_together(self):
         """While a prompt is read (a prefill in flight) the decoding requests
         step together on the Batcher's thread, not as groups; the answers

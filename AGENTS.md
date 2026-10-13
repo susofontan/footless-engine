@@ -164,7 +164,9 @@ gates, and correctness gates come before speed. Then:
   steps an even number of decoding requests as two groups on threads of their
   own, each at its own pace, while no prefill is in flight: two sessions with
   drafting 103 -> 111 tok/s in all, four sampled 127 -> 134, the same tokens
-  (2026-10-12).
+  (2026-10-12). An odd count of five and more splits too, two rows a group
+  at least: served five / seven sampled 142 -> 150, 159 -> 167 tok/s
+  (2026-10-13).
 - A cached state is taken for a prompt only when the shared prefix is worth
   its copy (HIT_MIN 256 tokens, or half its prompt): a fresh prompt had read
   long conversations' states from the disk to keep the template's first
