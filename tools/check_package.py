@@ -156,6 +156,18 @@ class Checker:
         self.free(st)
         assert got == self.reference, "a prompt in two chunks answers differently"
 
+    def ahead_hint(self):
+        """StepItem.ahead is a hint: the next step's tokens given on the step
+        before it -- right, or wrong -- change no answer."""
+        half = len(self.tokens) // 2
+        rest = list(self.tokens[half:])
+        for hint in (rest, rest[::-1] + [0]):
+            st = self.state()
+            self.rt.step([StepItem(st, list(self.tokens[:half]), None, ahead=hint)], self.ctx)
+            got = [self.feed(st, rest).token] + self.decode(st)
+            self.free(st)
+            assert got == self.reference, "a step's ahead hint changed the answer"
+
     def truncate(self):
         half = len(self.tokens) // 2
         st = self.state()
@@ -478,6 +490,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         c.reference_long = c.run_from(tokens, args.tokens * 2)
         c.check("step: a prompt in two chunks", c.chunked_prefill)
+        c.check("step: an ahead hint changes nothing", c.ahead_hint)
         c.check("truncate_state", c.truncate)
         c.check("clone_state", c.clone)
         c.check("export_state / import_state", c.export_import)

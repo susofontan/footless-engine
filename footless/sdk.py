@@ -96,6 +96,11 @@ class StepItem:
     # `start` counts from input_tokens[0], negative when the image began in an
     # earlier step; `length` is the whole image's
     images: list[ImageSpan] = field(default_factory=list)
+    # the tokens this state's NEXT step will feed after these (a prompt's next
+    # chunk), when the engine knows them: a hint a runtime may start work for
+    # beside this step (reading their rows from a disk). It never feeds them,
+    # and no result depends on it; empty when none are known.
+    ahead: list[int] = field(default_factory=list)
 
 
 @dataclass

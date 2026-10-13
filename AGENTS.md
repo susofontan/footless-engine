@@ -170,6 +170,11 @@ gates, and correctness gates come before speed. Then:
   (2026-10-12). An odd count of five and more splits too, two rows a group
   at least: served five / seven sampled 142 -> 150, 159 -> 167 tok/s
   (2026-10-13).
+- `StepItem.ahead` (a hint, no capability): the engine gives a prompt
+  chunk's step the next chunk's tokens; a runtime may start work for them
+  (the n-gram rows of the next chunk, read from the disk beside the GPU's
+  work: a served chunk 4.9 -> 4.4 s), never feeds them, and no answer
+  depends on it (2026-10-13).
 - A cached state is taken for a prompt only when the shared prefix is worth
   its copy (HIT_MIN 256 tokens, or half its prompt): a fresh prompt had read
   long conversations' states from the disk to keep the template's first

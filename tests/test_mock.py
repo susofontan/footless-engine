@@ -719,6 +719,26 @@ class BatcherTest(unittest.TestCase):
         self.assertEqual(max(self.rt.batches), 3, "the three decodes share steps")
         self.assertLess(len(self.rt.batches), 3 * 23, "fewer steps than one at a time")
 
+    def test_each_prefill_chunk_carries_the_next_one_as_its_hint(self):
+        """StepItem.ahead: a prompt fed in chunks hands each chunk's step the
+        tokens its next step feeds (a runtime may read ahead for them); the
+        last chunk's is empty, and the answer is the one without chunks."""
+        alone = self.engine.generate("x" * 40, 8).text
+        self.patch("CHUNK", 16)
+        seen = []
+        step = self.rt.step
+
+        def recording(batch, ctx):
+            seen.extend((list(i.input_tokens), list(i.ahead)) for i in batch if i.input_tokens)
+            return step(batch, ctx)
+        self.rt.step = recording
+        self.addCleanup(delattr, self.rt, "step")
+        self.engine.cache.free_all()
+        self.assertEqual(self.engine.generate("x" * 40, 8).text, alone)
+        fed = [tokens for tokens, _ in seen]
+        self.assertGreater(len(fed), 2)
+        self.assertEqual([ahead for _, ahead in seen], fed[1:] + [[]])
+
     def test_no_more_than_max_batch_at_once(self):
         batcher = Batcher(self.engine)
         tasks = [batcher.add(self.seq(f"request {i}")) for i in range(7)]

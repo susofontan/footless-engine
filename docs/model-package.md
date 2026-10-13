@@ -59,7 +59,9 @@ optional ones. What the engine relies on, verb by verb:
 - **step(batch, ctx).** One `StepResult` per item, in order. An item's
   `input_tokens` enter the model now (empty means: forward the token sampled
   last step, then sample); `sampling=None` is a prefill chunk that samples
-  nothing. Positions come from the state, never from the engine. Return only
+  nothing; `ahead` is the next step's tokens, a hint to read ahead for (never
+  fed, no result depends on it). Positions come from the state, never from
+  the engine. Return only
   when the device has finished — the engine times this call — and claim every
   state's room before any state moves, so a refusal leaves the batch intact.
 

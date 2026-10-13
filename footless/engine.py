@@ -1390,7 +1390,9 @@ class Engine:
             try:
                 while at < len(rest):
                     chunk = rest[at:at + self._chunk]
-                    yield Want(StepItem(state, chunk, None), ctx, left=len(rest) - at - len(chunk))
+                    after = at + len(chunk)
+                    yield Want(StepItem(state, chunk, None, ahead=rest[after:after + self._chunk]), ctx,
+                               left=len(rest) - after)
                     at += len(chunk)
                     if ctx.cancelled():
                         self.runtime.free_state(state)
@@ -1679,8 +1681,10 @@ class Engine:
                     o = matched + at
                     spans = [ImageSpan(sp.start - o, sp.length, sp.image) for sp in images
                              if sp.start < o + len(chunk) and sp.start + sp.length > o]
-                    result, elapsed = yield Want(StepItem(state, chunk, sample, spans), ctx,
-                                                 left=len(fed) - at - len(chunk))
+                    after = at + len(chunk)
+                    result, elapsed = yield Want(StepItem(state, chunk, sample, spans,
+                                                          ahead=fed[after:after + size]), ctx,
+                                                 left=len(fed) - after)
                     absorb(result)
                     # book the tokens that ran, not the tokens the request fed: a
                     # truncate can queue the kept prefix for re-forwarding inside

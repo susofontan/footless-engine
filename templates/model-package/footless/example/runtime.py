@@ -131,7 +131,8 @@ class Runtime:
 
         An item's `input_tokens` enter the model this step (empty = decode the
         token sampled last time); `sampling` None is a prefill chunk that
-        samples nothing. Claim every state's room before any state moves, so a
+        samples nothing; `ahead` (the next step's tokens) is a hint a runtime
+        may read ahead for -- never fed. Claim every state's room before any state moves, so a
         BudgetRefused leaves the batch as it was. Return only when the device
         has finished: the engine times this call.
         """

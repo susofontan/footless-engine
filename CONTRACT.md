@@ -185,7 +185,12 @@ config: what a request that pins nothing runs under. None leaves them to the
 engine.
 
 `StepItem`: `state`, `input_tokens: list[int]`, `sampling: SamplingSpec | None`,
-`images: list[ImageSpan]` (empty unless `vision` is on).
+`images: list[ImageSpan]` (empty unless `vision` is on), `ahead: list[int]` —
+the tokens this state's next step will feed after these (a prompt's next
+chunk), empty when the engine knows none. A hint: a runtime may start work for
+them beside this step (reading their rows from a disk); it never feeds them,
+and no result depends on it — the same answers with it, without it, or with
+it wrong.
 
 `Image`: `data: bytes` — the encoded file as the request sent it, opaque to
 the engine — and `digest`, the sha256 of the bytes: its identity.
