@@ -21,10 +21,9 @@ lives in the model's own folder.
 ```
 
 This repository is the engine, its contract, its tests and the tools to build
-and check model packages. Packages live next to their weights and are written
-against `footless.sdk` (see [docs/model-package.md](docs/model-package.md));
-one ships here without its weights: Qwen3.8-Flash-Next on an M3 Ultra with
-96 GB ([below](#qwen38-flash-next-on-an-m3-ultra)).
+and check model packages. It ships no model: packages live next to their
+weights and are written against `footless.sdk` (see
+[docs/model-package.md](docs/model-package.md)).
 
 ## The two parts
 
@@ -58,21 +57,6 @@ python3 -m unittest discover -s tests -t .
 ```
 
 `pip install -e .` adds a `footless` command for the same thing.
-
-## Qwen3.8-Flash-Next on an M3 Ultra
-
-[`models/qwen38-flash-next/footless/`](models/qwen38-flash-next/footless/README.md)
-is a package for [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
-on Apple Silicon with 96 GB: its own Metal kernels and host, routed experts in
-a 4-bit trellis format (61.8 GB, chat KL .0072 to the bf16 model), 262k tokens
-of context, up to eight requests decoding at once. Its weights are built from
-the published checkpoint by its recipe:
-
-```bash
-python3 models/qwen38-flash-next/footless/_recipe/prepare.py --checkpoint /path/to/Qwen3.8-Flash-Next
-python3 tools/check_package.py --model models/qwen38-flash-next
-./serve.sh
-```
 
 ## Command line
 
@@ -123,7 +107,7 @@ tests/           engine tests and three mock packages
 templates/       model-package/: the starting point for a new package
 tools/           harnesses for packages and servers (below)
 docs/            guides (below)
-models/          local workspace for model packages (only qwen38-flash-next/footless/ is tracked)
+models/          local workspace for model packages (not tracked)
 ```
 
 ## Tools

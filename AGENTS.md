@@ -67,9 +67,8 @@ and behind a declared capability unless every package must have it.
 
 ## Working on a model package
 
-Packages live next to their weights in `models/`, local workspace outside
-this repository's history -- but for `models/qwen38-flash-next/footless/`,
-whose weights its `_recipe/prepare.py` builds. Follow `docs/roadmap.md`: its phases end at
+Packages live outside this repository's history (`models/` is local
+workspace), next to their weights. Follow `docs/roadmap.md`: its phases end at
 gates, and correctness gates come before speed. Then:
 
 - `tools/check_package.py --model <dir>` must pass before a package is served.
@@ -105,9 +104,6 @@ gates, and correctness gates come before speed. Then:
 - Layout: `footless/` engine, CLI and SDK; `tests/` engine tests and mock
   packages; `tools/` reusable harnesses; `templates/` the package starting
   point; `docs/` guides; `models/` local packages, never tracked (2026-10).
-- `models/qwen38-flash-next/footless/` is tracked: the package's folder only;
-  its weights are built from the published checkpoint by `_recipe/prepare.py`,
-  bit for bit the served ones (`_recipe/pack.sha256`) (2026-10-13).
 - The serving API is an OpenAI-compatible surface in vLLM's shapes that
   ignores and logs what the engine cannot execute (2026-09-26).
 - `POST /v1/decisions` and `/v1/systemone` score typed questions at the answer

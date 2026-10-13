@@ -254,7 +254,7 @@ try:
         MODEL = json.loads(r.read())["data"][0]["id"]
 except Exception as exc:
     out(f"\n  {RED}✗ no footless server at {args.url}{RESET}  {GREY}({exc}){RESET}")
-    out(f"  {GREY}start it first, e.g.  ./serve.sh   or   python3 -m footless serve ...{RESET}\n")
+    out(f"  {GREY}start it first, e.g.  python3 -m footless serve ...{RESET}\n")
     sys.exit(1)
 
 if TTY:

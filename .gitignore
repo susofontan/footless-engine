@@ -9,3 +9,5 @@ dist/
 # model packages (weights, their footless/ folder and tests) are local workspace
 models/*
 !models/.gitkeep
+# a file's copy before a change (AGENTS.md): local, the change's history is git's
+_build/pre_*/
