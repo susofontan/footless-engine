@@ -168,11 +168,11 @@ class FrontEnd:
         job.push("error", (body, code))
 
     def _run(self, job: _Job):
-        """The job's generations, as a generator the Batcher drives (a
-        decision request runs at once and yields nothing)."""
+        """The job's generations, or its questions scored, as a generator the
+        Batcher drives."""
         request = job.request
         if isinstance(request, (wire.DecisionsRequest, wire.SystemOneRequest)):
-            return self._run_decisions(job, request)
+            return (yield from self._run_decisions(job, request))
         prompts: list[tuple[list[int], str]] = []  # (token ids, echoed text)
         images = []                                 # where the chat prompt's images sit
         if isinstance(request, wire.ChatRequest):
@@ -339,8 +339,10 @@ class FrontEnd:
 
     # -- the typed decision routes -----------------------------------------
 
-    def _run_decisions(self, job: _Job, request) -> None:
-        """A decision request: every question scored, nothing generated.
+    def _run_decisions(self, job: _Job, request):
+        """A decision request: every question scored, nothing generated -- a
+        generator the Batcher drives, its head read beside the running
+        requests (`Engine.label_sequence`).
 
         One question is one user message rendered with thinking off, scored
         at the answer position through the package's `label_logprobs` verb.
@@ -413,7 +415,7 @@ class FrontEnd:
                 n += 1
             shared = n
         try:
-            scored_all = self.engine.label_logprobs_batch(
+            scored_all = yield from self.engine.label_sequence(
                 [(prompt_ids, labels) for _, _, labels, prompt_ids in prepared], job.ctx,
                 shared=shared)
         except ValueError as exc:  # a label, or a prompt that does not round-trip

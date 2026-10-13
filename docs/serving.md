@@ -36,8 +36,10 @@ prefill runs; with a prefill in flight they step together. How the rows of
 one step are computed is the package's business; each item's result must be
 the one it would get alone (CONTRACT.md). A step the budget refuses runs again
 without its youngest request: that one waits in the prefix cache and is
-admitted again later. The choices of one request (`n`) run one after another,
-and decision requests run between steps. A client that disconnects cancels its
+admitted again later. The choices of one request (`n`) run one after another.
+A decision request is admitted like the others: its head is read in the
+steps, beside the running requests, and its questions are then scored between
+steps. A client that disconnects cancels its
 request at the next step boundary.
 
 A package with `max_batch = 1` is served one request at a time, by the same
@@ -162,7 +164,9 @@ message rendered with thinking off; its answer is the probability of every
 option, read from the next-token scores at the answer position
 (`label_logprobs`). The questions of one request are scored in one
 `label_logprobs_batch` call, from the prefix cache's state of the head they
-share, so new questions about the same input skip re-reading it.
+share, so new questions about the same input skip re-reading it. The head is
+read as a prompt is (`Engine.label_sequence`): admitted, looked up, fed in the
+Batcher's prefill steps -- running answers go on decoding meanwhile.
 
 A package that does not declare `label_logprobs` is refused with the reason.
 Requests wrong of themselves fail — 400, or 422 with the System One `detail`

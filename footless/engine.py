@@ -1330,72 +1330,92 @@ class Engine:
 
     def label_logprobs_batch(self, items: list, ctx: StepContext | None = None,
                              shared: int = 0) -> list[list[tuple[int, float]]] | None:
-        """`label_logprobs` for several (input_tokens, labels) pairs, in order.
+        """`label_logprobs` for several (input_tokens, labels) pairs, in order:
+        `label_sequence` run alone to its end (its docstring)."""
+        return Batcher(self).run(self.label_sequence(items, ctx, shared))
+
+    def label_sequence(self, items: list, ctx: StepContext | None = None, shared: int = 0):
+        """`label_logprobs_batch` as a generator a `Batcher` drives beside
+        other requests; returns the scores, or None once `ctx` is cancelled.
 
         Through the package's optional `label_logprobs_batch` when it has one
         (it may share the work the prompts have in common), else one
         `label_logprobs` call per pair -- the same gate either way, and a
-        cancelled `ctx` stops between pairs (None is returned). A `ValueError`
-        carries `.item`, the index of the pair at fault.
+        cancelled `ctx` stops between pairs. A `ValueError` carries `.item`,
+        the index of the pair at fault.
 
         `shared` names a head of that many tokens the caller expects later
         requests to repeat (a decision's template and input text), clamped to
         what every pair really shares short of its last token. With the batch
-        verb the head goes through the prefix cache: looked up, the rest of it
-        forwarded by `step`, the pairs scored from that state, and the state
+        verb the head goes through the prefix cache as a request's prompt
+        does: admitted (`Admit`), looked up (`Wait` on the disk), the rest of
+        it fed as prefill items of the Batcher's steps (`Want`, beside the
+        running requests), the pairs scored from that state, and the state
         kept as the head's entry -- a repeated head is not forwarded again.
         """
         if LABEL_LOGPROBS not in self.facts.capabilities:
             self.label_logprobs([], [])        # raises the capability's ContractError
-        batch = getattr(self.runtime, "label_logprobs_batch", None)
-        if callable(batch):
-            if shared > 0 and items:
-                first = items[0][0]
-                shared = min(shared, *(len(t) - 1 for t, _ in items))
-                for t, _ in items[1:]:
-                    n = 0
-                    while n < shared and t[n] == first[n]:
-                        n += 1
-                    shared = n
-            if shared > 0 and items:
-                return self._label_from_cache(batch, items, list(first[:shared]), ctx)
-            return batch(items)
-        out = []
-        for k, (input_tokens, labels) in enumerate(items):
-            if ctx is not None and ctx.cancelled():
-                return None
-            try:
-                out.append(self.label_logprobs(input_tokens, labels))
-            except ValueError as exc:
-                exc.item = k
-                raise
-        return out
-
-    def _label_from_cache(self, batch, items: list, head: list[int],
-                          ctx: StepContext | None):
-        """`label_logprobs_batch` from the cached state of `head`."""
         ctx = ctx if ctx is not None else StepContext()
-        state, matched = self.cache.lookup(head)
-        try:
-            rest = head[matched:]
-            for i in range(0, len(rest), CHUNK):
-                self.runtime.step([StepItem(state, rest[i:i + CHUNK], None)], ctx)
+        batch = getattr(self.runtime, "label_logprobs_batch", None)
+        if callable(batch) and shared > 0 and items:
+            first = items[0][0]
+            shared = min(shared, *(len(t) - 1 for t, _ in items))
+            for t, _ in items[1:]:
+                n = 0
+                while n < shared and t[n] == first[n]:
+                    n += 1
+                shared = n
+        if not callable(batch) or shared <= 0 or not items:
+            if callable(batch):
+                return batch(items)
+            out = []
+            for k, (input_tokens, labels) in enumerate(items):
+                if ctx.cancelled():
+                    return None
+                try:
+                    out.append(self.label_logprobs(input_tokens, labels))
+                except ValueError as exc:
+                    exc.item = k
+                    raise
+            return out
+            yield                               # (a generator all the same)
+        head = list(items[0][0][:shared])
+        while True:
+            yield Admit(self.facts.cache_bytes_per_token * (len(head) + ADMIT_HEADROOM))
+            ticket = self.cache.begin_lookup(head)
+            while not ticket.ready():
+                yield Wait(ticket)
+            state, matched = ticket.result()
+            rest, at = head[matched:], 0
+            try:
+                while at < len(rest):
+                    chunk = rest[at:at + self._chunk]
+                    yield Want(StepItem(state, chunk, None), ctx, left=len(rest) - at - len(chunk))
+                    at += len(chunk)
+                    if ctx.cancelled():
+                        self.runtime.free_state(state)
+                        return None
+                if not rest:
+                    # settles what a partial match queued (a replay), forwards nothing otherwise
+                    yield Want(StepItem(state, [], None), ctx)
                 if ctx.cancelled():
                     self.runtime.free_state(state)
                     return None
-            if not rest:
-                # settles what a partial match queued (a replay), forwards nothing otherwise
-                self.runtime.step([StepItem(state, [], None)], ctx)
-            result = batch(items, state=state)
-        except ValueError:
-            self.cache.store(head, state)  # the caller's labels at fault; the head is good
-            raise
-        except BaseException:
-            self.runtime.free_state(state)
-            raise
-        # the verb leaves the state as it found it: the head's entry
-        self.cache.store(head, state)
-        return result
+                result = batch(items, state=state)
+            except Preempted:
+                # the batch needs this request's room: the head so far waits
+                # in the prefix cache for its next admission
+                self.cache.store(head[:matched + at], state)
+                continue
+            except ValueError:
+                self.cache.store(head, state)  # the caller's labels at fault; the head is good
+                raise
+            except BaseException:
+                self.runtime.free_state(state)
+                raise
+            # the verb leaves the state as it found it: the head's entry
+            self.cache.store(head, state)
+            return result
 
     def chat_prompt(self, messages: list[dict], thinking: bool = True,
                     level: str | None = None, tools: list[dict] | None = None) -> "Prompt":

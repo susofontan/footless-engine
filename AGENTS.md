@@ -113,6 +113,9 @@ gates, and correctness gates come before speed. Then:
 - `POST /v1/decisions` and `/v1/systemone` score typed questions at the answer
   position behind `label_logprobs`, all of a request's questions in one
   `label_logprobs_batch` call from the prefix cache's head state (2026-10-01).
+  The request is one of the Batcher's tasks: admitted, its head read in
+  prefill steps beside the running requests (they decoded 0.4 -> 11 tok/s
+  through a cold request), the scoring between steps (2026-10-13).
 - A package declares its `thinking_levels`; `chat` takes one by name, mapped as
   vLLM maps `reasoning_effort` (2026-09-26).
 - `set_speculative` is an optional verb behind `speculative`; `generate`, `chat`

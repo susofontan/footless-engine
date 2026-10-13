@@ -645,6 +645,56 @@ class HeadCacheTest(unittest.TestCase):
         self.assertEqual(self.heads[-1], [1, 2, 3, 4])   # its answer token stays a tail
 
 
+class BesideAnswersTest(unittest.TestCase):
+    """A decision request is one of the Batcher's tasks: its head is read in
+    a prefill step on a thread of its own (concurrent_prefill) while a
+    running answer goes on decoding, not held for the request's length."""
+
+    def test_an_answer_decodes_while_a_head_is_read(self):
+        api = Api(THINKING)
+        self.addCleanup(api.close)
+        runtime = api.engine.runtime
+        step = runtime.step
+        lock = threading.Lock()
+        heads, decodes = [], []        # (start, end) of the head's steps; decode steps' starts
+
+        def slow(batch, ctx):
+            head = any(len(i.input_tokens) > 100 and i.sampling is None for i in batch)
+            decode = any(not i.input_tokens and i.sampling is not None for i in batch)
+            start = time.perf_counter()
+            if decode:
+                with lock:
+                    decodes.append(start)
+            time.sleep(0.3 if head else 0.02 if decode else 0.0)
+            try:
+                return step(batch, ctx)
+            finally:
+                if head:
+                    with lock:
+                        heads.append((start, time.perf_counter()))
+
+        runtime.step = slow
+        runtime.label_logprobs_batch = \
+            lambda items, state=None: [runtime.label_logprobs(t, labels) for t, labels in items]
+        self.addCleanup(delattr, runtime, "step")
+        self.addCleanup(delattr, runtime, "label_logprobs_batch")
+        answer = threading.Thread(target=api.post, args=(
+            "/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 64}))
+        answer.start()
+        deadline = time.time() + 5
+        while not decodes and time.time() < deadline:
+            time.sleep(0.005)
+        status, _ = api.post("/v1/decisions", {
+            "input": "S: " + "it rains " * 13,
+            "questions": [{"id": "wet", "type": "yes_no", "question": "Is it wet?"}]})
+        answer.join()
+        self.assertEqual(status, 200)
+        self.assertTrue(heads, "the head was read in a step")
+        lo, hi = heads[0]
+        self.assertTrue(any(lo < s < hi for s in decodes),
+                        "the answer did not decode while the head was read")
+
+
 class CancellationTest(unittest.TestCase):
     """A request cancelled between questions abandons quietly."""
 
