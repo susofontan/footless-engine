@@ -65,7 +65,7 @@ python3 -m unittest discover -s tests -t .
 is a package for [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)
 on Apple Silicon with 96 GB: its own Metal kernels and host, routed experts in
 a 4-bit trellis format (61.8 GB, chat KL .0072 to the bf16 model), 262k tokens
-of context, up to four requests decoding at once. Its weights are built from
+of context, up to eight requests decoding at once. Its weights are built from
 the published checkpoint by its recipe:
 
 ```bash
