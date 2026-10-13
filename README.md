@@ -69,7 +69,7 @@ of context, up to four requests decoding at once. Its weights are built from
 the published checkpoint by its recipe:
 
 ```bash
-python3 models/qwen38-flash-next/footless/recipe/prepare.py --checkpoint /path/to/Qwen3.8-Flash-Next
+python3 models/qwen38-flash-next/footless/_recipe/prepare.py --checkpoint /path/to/Qwen3.8-Flash-Next
 python3 tools/check_package.py --model models/qwen38-flash-next
 ./serve.sh
 ```
