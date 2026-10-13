@@ -38,8 +38,7 @@ class Api:
             self.engine, model_name or self.engine.model.name,
             root=str(package), api_key=api_key,
         )
-        self.httpd = serving.ThreadingHTTPServer(("127.0.0.1", 0), serving._Handler)
-        self.httpd.daemon_threads = True
+        self.httpd = serving._Server(("127.0.0.1", 0), serving._Handler)
         self.httpd.front = self.front
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self.front.start()  # the mock cares nothing about thread affinity
@@ -102,6 +101,26 @@ class ServeTest(unittest.TestCase):
         return self.api.post("/v1/chat/completions", body)
 
     # -- routes without generation ----------------------------------------
+
+    def test_requests_arriving_together_are_all_answered(self):
+        """Python's listen queue of 5 reset connections when clients arrived
+        together (3 of 24 requests at 8 at once): every one is answered."""
+        n = 32
+        start = threading.Barrier(n)
+        got = []
+
+        def one():
+            start.wait()
+            try:
+                got.append(self.chat(max_tokens=2)[0])
+            except OSError as exc:
+                got.append(type(exc).__name__)
+        threads = [threading.Thread(target=one) for _ in range(n)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(got, [200] * n)
 
     def test_health(self):
         status, _ = self.api.request("GET", "/health")

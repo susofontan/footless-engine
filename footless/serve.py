@@ -837,6 +837,13 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------- the server
 
 
+class _Server(ThreadingHTTPServer):
+    # the listen queue: Python's default of 5 reset connections when clients
+    # arrived together -- 3 of 24 requests at 8 at once, most at 32
+    request_queue_size = 1024
+    daemon_threads = True
+
+
 def serve(engine: Engine, host: str = "127.0.0.1", port: int = 8000,
           model_name: str | None = None, root: str | None = None,
           api_key: str | None = None) -> None:
@@ -848,8 +855,7 @@ def serve(engine: Engine, host: str = "127.0.0.1", port: int = 8000,
     """
     front = FrontEnd(engine, model_name or engine.model.name,
                      root if root is not None else "", api_key)
-    server = ThreadingHTTPServer((host, port), _Handler)
-    server.daemon_threads = True
+    server = _Server((host, port), _Handler)
     server.front = front
     bound = server.server_address[:2]
     front._log("info", f"serving {front.model_name} on http://{bound[0]}:{bound[1]}/v1")
