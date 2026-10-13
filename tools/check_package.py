@@ -198,7 +198,7 @@ class Checker:
         mb = self.engine.facts.max_batch
         if mb < 2:
             raise Skip("max_batch is 1")
-        k = min(mb, 4)
+        k = min(mb, 8)                  # the whole batch a package declares, up to 8
         prompts = self._prompts(k)
         alone = [self.run_from(p) for p in prompts]
         states = [self.state() for _ in prompts]

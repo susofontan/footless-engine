@@ -44,6 +44,27 @@ class CheckPackageTest(unittest.TestCase):
         self.assertRegex(report, r"PASS\s+concurrent_decode")
         self.assertRegex(tools, r"SKIP\s+concurrent_decode\s+not declared")
 
+    def test_the_batch_check_runs_the_declared_batch(self):
+        """A package declaring max_batch 8 has eight sequences checked as alone
+        (it was four whatever the package declared)."""
+        import re
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = Path(tmp) / "mockup8"
+            shutil.copytree(ROOT / "tests" / "mockup", pkg)
+            for f, old, new in (("footless/manifest", "max_batch = 4", "max_batch = 8"),
+                                ("footless/mock/runtime.py", "MAX_BATCH = 4", "MAX_BATCH = 8")):
+                path = pkg / f
+                text = path.read_text()
+                self.assertIn(old, text)
+                path.write_text(text.replace(old, new))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                status = check_package.main(["--model", str(pkg)])
+            self.assertEqual(status, 0, out.getvalue())
+            self.assertRegex(out.getvalue(), re.compile(r"PASS\s+batch: each item as alone\s+8 sequences"))
+
     def test_a_package_that_breaks_a_rule_fails(self):
         """A mock whose clone forgets the state is caught: the check has teeth."""
         engine_open = check_package.Engine.open
